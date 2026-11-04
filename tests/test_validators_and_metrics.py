@@ -1,18 +1,13 @@
 import json
-import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
 
 
-BACKEND_DIR = Path(__file__).resolve().parents[1] / "backend"
-sys.path.insert(0, str(BACKEND_DIR))
-
-from services import evidence_extractor  # noqa: E402
-from services.quality_metrics import (  # noqa: E402
+from services import evidence_extractor
+from services.quality_metrics import (
     calculate_precision,
     calculate_recall,
     meets_precision_target,
@@ -20,7 +15,7 @@ from services.quality_metrics import (  # noqa: E402
     meets_teacher_time_target,
     teacher_active_time_seconds,
 )
-from services.validators import is_institutional_email  # noqa: E402
+from services.validators import is_institutional_email
 
 
 @pytest.mark.parametrize(
