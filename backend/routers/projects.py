@@ -10,6 +10,7 @@ from services.evidence_extractor import (
     extract_from_ipynb,
     MAX_CHARS_FOR_LLM,
 )
+from services.validators import is_institutional_email
 
 router = APIRouter(prefix="/api/v1/projects", tags=["Módulo 3.2 - Proyectos y Evidencias"])
 
@@ -32,7 +33,11 @@ def create_project_draft(payload: ProjectCreateRequest):
     HU03: Como estudiante, quiero registrar un proyecto asociado a un curso y docente
     para incorporarlo a mi portafolio académico en estado 'Borrador'.
     """
-    if not payload.student_email.endswith("@unmsm.edu.pe") or not payload.teacher_email.endswith("@unmsm.edu.pe"):
+    institutional_emails = (
+        is_institutional_email(str(payload.student_email)),
+        is_institutional_email(str(payload.teacher_email)),
+    )
+    if not all(institutional_emails):
         raise HTTPException(
             status_code=400,
             detail="Tanto el correo del estudiante como el del docente deben pertenecer al dominio @unmsm.edu.pe"
