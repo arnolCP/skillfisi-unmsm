@@ -1,5 +1,6 @@
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,14 @@ BACKEND_DIR = Path(__file__).resolve().parents[1] / "backend"
 sys.path.insert(0, str(BACKEND_DIR))
 
 from services import evidence_extractor  # noqa: E402
+from services.quality_metrics import (  # noqa: E402
+    calculate_precision,
+    calculate_recall,
+    meets_precision_target,
+    meets_recall_target,
+    meets_teacher_time_target,
+    teacher_active_time_seconds,
+)
 from services.validators import is_institutional_email  # noqa: E402
 
 
@@ -131,3 +140,57 @@ def test_truncates_notebook_evidence_at_llm_security_limit():
     )
 
     assert len(result) == evidence_extractor.MAX_CHARS_FOR_LLM
+
+
+def test_calculates_teacher_active_time_in_seconds():
+    opened_at = datetime(2026, 11, 4, 14, 0, tzinfo=timezone.utc)
+    decision_at = opened_at + timedelta(minutes=4, seconds=30)
+
+    assert teacher_active_time_seconds(opened_at, decision_at) == 270
+
+
+def test_accepts_teacher_time_at_300_second_boundary():
+    opened_at = datetime(2026, 11, 4, 14, 0, tzinfo=timezone.utc)
+
+    assert meets_teacher_time_target(opened_at, opened_at + timedelta(seconds=300))
+    assert not meets_teacher_time_target(
+        opened_at,
+        opened_at + timedelta(seconds=301),
+    )
+
+
+def test_rejects_teacher_decision_before_project_opening():
+    opened_at = datetime(2026, 11, 4, 14, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(ValueError, match="anterior"):
+        teacher_active_time_seconds(opened_at, opened_at - timedelta(seconds=1))
+
+
+def test_calculates_precision_and_recall_formulas():
+    assert calculate_precision(85, 15) == pytest.approx(0.85)
+    assert calculate_recall(80, 20) == pytest.approx(0.80)
+
+
+def test_applies_precision_acceptance_threshold():
+    assert meets_precision_target(85, 15)
+    assert not meets_precision_target(84, 16)
+
+
+def test_applies_recall_acceptance_threshold():
+    assert meets_recall_target(80, 20)
+    assert not meets_recall_target(79, 21)
+
+
+@pytest.mark.parametrize(
+    ("metric", "counts"),
+    [
+        (calculate_precision, (0, 0)),
+        (calculate_recall, (0, 0)),
+        (calculate_precision, (-1, 1)),
+        (calculate_recall, (1, -1)),
+        (calculate_precision, (True, 1)),
+    ],
+)
+def test_rejects_invalid_quality_metric_counts(metric, counts):
+    with pytest.raises(ValueError):
+        metric(*counts)
