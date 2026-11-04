@@ -9,6 +9,7 @@ from services.evidence_extractor import (
     extract_from_pdf,
     extract_from_ipynb,
     MAX_CHARS_FOR_LLM,
+    truncate_for_llm,
 )
 from services.validators import is_institutional_email
 
@@ -103,7 +104,7 @@ async def upload_project_evidences(
             )
 
     # 3. Aplicar truncado inteligente para proteger la cuota de tokens del LLM (R03)
-    final_clean_text = "\n".join(combined_evidence)[:MAX_CHARS_FOR_LLM]
+    final_clean_text = truncate_for_llm("\n".join(combined_evidence))
 
     # 4. Guardar evidencia en el proyecto lista para que el módulo 3.3 (Erick) la procese con IA
     project = MOCK_PROJECTS_DB[project_id]

@@ -13,6 +13,14 @@ GITHUB_OWNER_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9]
 GITHUB_REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 
 
+def truncate_for_llm(text: str) -> str:
+    """Apply the single character quota used by every LLM-bound evidence source."""
+    if not isinstance(text, str):
+        raise TypeError("El contenido de la evidencia debe ser texto.")
+
+    return text[:MAX_CHARS_FOR_LLM]
+
+
 def parse_github_url(url: str) -> tuple[str, str]:
     """Valida que la URL sea de GitHub y extrae el usuario (owner) y nombre del repositorio."""
     if not isinstance(url, str):
@@ -124,7 +132,7 @@ def extract_from_github(github_url: str) -> str:
             extracted_parts.append(f"\n--- ARCHIVO: {filename} ---\n{content}")
 
     full_text = "\n".join(extracted_parts)
-    return full_text[:MAX_CHARS_FOR_LLM]
+    return truncate_for_llm(full_text)
 
 
 def extract_from_pdf(file_bytes: bytes) -> str:
@@ -138,7 +146,7 @@ def extract_from_pdf(file_bytes: bytes) -> str:
             if text:
                 pages_text.append(text)
         full_text = "\n".join(pages_text)
-        return full_text[:MAX_CHARS_FOR_LLM]
+        return truncate_for_llm(full_text)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error al leer el archivo PDF: {str(e)}")
 
@@ -162,6 +170,6 @@ def extract_from_ipynb(file_bytes: bytes) -> str:
                 if code_lines:
                     extracted_cells.append("\n".join(code_lines))
         full_text = "\n---\n".join(extracted_cells)
-        return full_text[:MAX_CHARS_FOR_LLM]
+        return truncate_for_llm(full_text)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error al leer el notebook .ipynb: {str(e)}")
