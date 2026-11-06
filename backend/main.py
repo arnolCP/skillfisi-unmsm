@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers import projects
+from routers import projects, llm_extraction
 
 app = FastAPI(
     title="SkillFISI API - UNMSM",
@@ -19,6 +20,9 @@ app.add_middleware(
 
 # Incluir el Módulo 3.2 desarrollado por Arnol Condori
 app.include_router(projects.router)
+
+# Incluir el Módulo 3.3 desarrollado por Erick Ticsihua
+app.include_router(llm_extraction.router)
 
 
 @app.get("/")
