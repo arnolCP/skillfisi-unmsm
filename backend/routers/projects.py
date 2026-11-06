@@ -9,7 +9,9 @@ from services.evidence_extractor import (
     extract_from_pdf,
     extract_from_ipynb,
     MAX_CHARS_FOR_LLM,
+    truncate_for_llm,
 )
+from services.validators import is_institutional_email
 
 router = APIRouter(prefix="/api/v1/projects", tags=["Módulo 3.2 - Proyectos y Evidencias"])
 
@@ -32,7 +34,11 @@ def create_project_draft(payload: ProjectCreateRequest):
     HU03: Como estudiante, quiero registrar un proyecto asociado a un curso y docente
     para incorporarlo a mi portafolio académico en estado 'Borrador'.
     """
-    if not payload.student_email.endswith("@unmsm.edu.pe") or not payload.teacher_email.endswith("@unmsm.edu.pe"):
+    institutional_emails = (
+        is_institutional_email(str(payload.student_email)),
+        is_institutional_email(str(payload.teacher_email)),
+    )
+    if not all(institutional_emails):
         raise HTTPException(
             status_code=400,
             detail="Tanto el correo del estudiante como el del docente deben pertenecer al dominio @unmsm.edu.pe"
@@ -98,7 +104,7 @@ async def upload_project_evidences(
             )
 
     # 3. Aplicar truncado inteligente para proteger la cuota de tokens del LLM (R03)
-    final_clean_text = "\n".join(combined_evidence)[:MAX_CHARS_FOR_LLM]
+    final_clean_text = truncate_for_llm("\n".join(combined_evidence))
 
     # 4. Guardar evidencia en el proyecto lista para que el módulo 3.3 (Erick) la procese con IA
     project = MOCK_PROJECTS_DB[project_id]
