@@ -6,3 +6,4 @@ pypdf
 python-multipart
 python-dotenv
 pytest
+supabase==2.33.0

@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers import projects
+from routers import auth_profiles
 
 app = FastAPI(
     title="SkillFISI API - UNMSM",
@@ -19,6 +20,7 @@ app.add_middleware(
 
 # Incluir el Módulo 3.2 desarrollado por Arnol Condori
 app.include_router(projects.router)
+app.include_router(auth_profiles.router)
 
 
 @app.get("/")
