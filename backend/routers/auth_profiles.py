@@ -1,6 +1,7 @@
-"""Módulo 3.1: autenticación institucional (HU01) y perfil académico (HU02)."""
+"""Módulo 3.1: autenticación institucional (HU01), perfil académico (HU02) y control de roles."""
 
 import logging
+from collections.abc import Callable
 from typing import Annotated
 from urllib.parse import urlparse
 from uuid import UUID
@@ -17,6 +18,7 @@ from supabase import (
 )
 
 from services.supabase_client import create_auth_client, get_admin_client
+from services.validators import is_institutional_email
 
 logger = logging.getLogger(__name__)
 
@@ -24,38 +26,22 @@ router = APIRouter(prefix="/api/v1", tags=["Módulo 3.1 - Autenticación y Perfi
 
 USERS_TABLE = "users"
 DEFAULT_ROLE = "Estudiante"
+VALID_ROLES = frozenset({"Estudiante", "Docente", "Autoridad"})
 PROFILE_FIELDS = "full_name,email,student_code,school,current_cycle,linkedin_url,github_url"
 
 INVALID_DOMAIN_DETAIL = "Acceso restringido: debes usar tu correo institucional (@unmsm.edu.pe)."
+TEACHER_SIGNUP_DETAIL = "Las cuentas de docente las crea el equipo del proyecto."
+MISSING_PROFILE_DETAIL = (
+    "Tu cuenta no tiene un perfil académico registrado. Contacta al equipo del proyecto."
+)
+ROLE_FORBIDDEN_DETAIL = "No tienes permiso para realizar esta acción."
 AUTH_UNAVAILABLE_DETAIL = "El servicio de autenticación no está disponible. Intenta nuevamente."
 DB_UNAVAILABLE_DETAIL = "No se pudo acceder a la base de datos. Intenta nuevamente."
 
 
-# ---------------------------------------------------------------------------
-# Validación de correo institucional
-# TODO: reemplazar _INSTITUTIONAL_EMAIL_DOMAIN, _normalize_email e _is_institutional_email
-# por is_institutional_email de services/validators.py cuando esté en main.
-# ---------------------------------------------------------------------------
-_INSTITUTIONAL_EMAIL_DOMAIN = "unmsm.edu.pe"
-
-
 def _normalize_email(email: str) -> str:
+    """Misma normalización que usa is_institutional_email: sin espacios y en minúsculas."""
     return email.strip().casefold()
-
-
-def _is_institutional_email(email: str) -> bool:
-    """Un solo @ y dominio exactamente unmsm.edu.pe (sin subdominios)."""
-    if not isinstance(email, str):
-        return False
-
-    local_part, separator, domain = _normalize_email(email).rpartition("@")
-
-    return bool(
-        separator
-        and local_part
-        and "@" not in local_part
-        and domain == _INSTITUTIONAL_EMAIL_DOMAIN
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +51,11 @@ class RegisterRequest(BaseModel):
     email: str = Field(max_length=255)
     password: str = Field(min_length=8, max_length=72)
     full_name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=3, max_length=255)]
+    role: str | None = Field(
+        default=None,
+        max_length=50,
+        description="Opcional. El registro público solo crea cuentas con rol Estudiante.",
+    )
 
 
 class LoginRequest(BaseModel):
@@ -135,8 +126,12 @@ class CurrentUser(BaseModel):
     email: str
 
 
+class AuthorizedUser(CurrentUser):
+    role: str
+
+
 # ---------------------------------------------------------------------------
-# Dependencia reutilizable: usuario autenticado
+# Dependencias reutilizables: usuario autenticado y control de roles
 # ---------------------------------------------------------------------------
 _bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -178,10 +173,81 @@ def get_current_user(
     user = response.user if response else None
     if user is None or not user.email:
         raise unauthorized
-    if not _is_institutional_email(user.email):
+    if not is_institutional_email(user.email):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=INVALID_DOMAIN_DETAIL)
 
     return CurrentUser(id=str(user.id).casefold(), email=_normalize_email(user.email))
+
+
+def _fetch_role(user_id: str) -> str | None:
+    """Lee el rol en public.users, la única fuente de verdad del rol.
+
+    Nunca se toma del token ni de user_metadata, porque el propio usuario puede modificar
+    user_metadata. Devuelve None si la cuenta no tiene fila en la tabla users.
+    """
+    try:
+        result = (
+            get_admin_client()
+            .table(USERS_TABLE)
+            .select("role")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        logger.error("Error al consultar el rol: %s", type(exc).__name__)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=DB_UNAVAILABLE_DETAIL)
+
+    if not result.data:
+        return None
+    return result.data[0]["role"]
+
+
+def require_role(*roles: str) -> Callable[..., AuthorizedUser]:
+    """Crea una dependencia que solo deja pasar a usuarios con alguno de los roles indicados.
+
+    Valida el token con get_current_user y después lee el rol en public.users.
+    Respuestas: 401 sin token o con token inválido; 403 si el correo no es institucional,
+    si la cuenta no tiene perfil o si el rol no coincide; 503 si Supabase no responde.
+
+    Uso en un endpoint (por ejemplo, en routers/teacher_reviews.py):
+
+        from typing import Annotated
+        from fastapi import Depends
+        from routers.auth_profiles import AuthorizedUser, require_role
+
+        @router.get("/pending")
+        def get_pending_reviews(
+            teacher: Annotated[AuthorizedUser, Depends(require_role("Docente"))],
+        ):
+            # teacher.id, teacher.email y teacher.role salen del token y de la tabla users.
+            # Usar teacher.email para filtrar, en lugar de recibir teacher_email del cliente.
+            ...
+
+    Si el endpoint no necesita los datos del usuario, basta con declararla en el decorador:
+
+        @router.post("/{project_id}/open", dependencies=[Depends(require_role("Docente"))])
+
+    Para aceptar varios roles: require_role("Docente", "Autoridad").
+    """
+    if not roles:
+        raise ValueError("require_role necesita al menos un rol.")
+    unknown_roles = set(roles) - VALID_ROLES
+    if unknown_roles:
+        raise ValueError(f"Roles no válidos en require_role: {sorted(unknown_roles)}")
+    allowed_roles = frozenset(roles)
+
+    def _check_role(
+        current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    ) -> AuthorizedUser:
+        role = _fetch_role(current_user.id)
+        if role is None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=MISSING_PROFILE_DETAIL)
+        if role not in allowed_roles:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ROLE_FORBIDDEN_DETAIL)
+        return AuthorizedUser(id=current_user.id, email=current_user.email, role=role)
+
+    return _check_role
 
 
 def _ensure_profile_owner(user_id: UUID, current_user: CurrentUser) -> str:
@@ -226,9 +292,15 @@ def _fetch_profile(user_id: str) -> dict:
 # ---------------------------------------------------------------------------
 @router.post("/auth/register", status_code=status.HTTP_201_CREATED)
 def register(payload: RegisterRequest):
-    """HU01: crea una cuenta de estudiante solo con correo @unmsm.edu.pe."""
-    if not _is_institutional_email(payload.email):
+    """HU01: crea una cuenta de estudiante solo con correo @unmsm.edu.pe.
+
+    El registro público nunca asigna otro rol: las cuentas de Docente y Autoridad
+    las crea el equipo del proyecto.
+    """
+    if not is_institutional_email(payload.email):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=INVALID_DOMAIN_DETAIL)
+    if payload.role is not None and payload.role != DEFAULT_ROLE:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=TEACHER_SIGNUP_DETAIL)
 
     email = _normalize_email(payload.email)
     admin = get_admin_client()
@@ -291,8 +363,8 @@ def register(payload: RegisterRequest):
 
 @router.post("/auth/login")
 def login(payload: LoginRequest):
-    """HU01: inicia sesión solo con correo @unmsm.edu.pe y devuelve el token de acceso."""
-    if not _is_institutional_email(payload.email):
+    """HU01: inicia sesión solo con correo @unmsm.edu.pe y devuelve el token de acceso y el rol."""
+    if not is_institutional_email(payload.email):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=INVALID_DOMAIN_DETAIL)
 
     invalid_credentials = HTTPException(
@@ -324,11 +396,18 @@ def login(payload: LoginRequest):
     if result.session is None or result.user is None:
         raise invalid_credentials
 
+    # El rol se consulta después de validar la contraseña para no revelar qué cuentas tienen perfil.
+    user_id = str(result.user.id)
+    role = _fetch_role(user_id)
+    if role is None:
+        logger.warning("La cuenta %s inició sesión pero no tiene fila en la tabla users", user_id)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=MISSING_PROFILE_DETAIL)
+
     return {
         "access_token": result.session.access_token,
         "token_type": "bearer",
         "expires_in": result.session.expires_in,
-        "user": {"id": str(result.user.id), "email": result.user.email},
+        "user": {"id": user_id, "email": result.user.email, "role": role},
     }
 
 
