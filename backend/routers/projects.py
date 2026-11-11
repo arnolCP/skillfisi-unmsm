@@ -1,128 +1,223 @@
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
-from pydantic import BaseModel, EmailStr
-from typing import Optional
+from pydantic import BaseModel, EmailStr, Field, field_validator
+from typing import Optional, List, Dict
 from datetime import datetime, timezone
 import uuid
 
+import services.evidence_extractor as extractor
 from services.evidence_extractor import (
     extract_from_github,
     extract_from_pdf,
     extract_from_ipynb,
-    MAX_CHARS_FOR_LLM,
-    truncate_for_llm,
 )
-from services.validators import is_institutional_email
 
-router = APIRouter(prefix="/api/v1/projects", tags=["Módulo 3.2 - Proyectos y Evidencias"])
+MAX_CHARS_FOR_LLM = getattr(extractor, "MAX_CHARS_FOR_LLM", 12000)
 
-# Almacenamiento en memoria temporal mientras Demian y Bryan conectan Supabase
-MOCK_PROJECTS_DB = {}
+router = APIRouter(
+    prefix="/api/v1/projects",
+    tags=["Módulo 3.2 - Proyectos, Evidencias y Envío HITL (HU03, HU04, HU06)"],
+)
+
+# Almacenamiento en memoria compartido con el módulo de revisión docente (3.4)
+PROJECTS_DB: Dict[str, dict] = {}
+
+
+def consolidate_and_truncate(blocks: List[str], max_chars: int = MAX_CHARS_FOR_LLM) -> str:
+    combined = "\n\n".join(b.strip() for b in blocks if b and b.strip())
+    if len(combined) > max_chars:
+        return combined[:max_chars]
+    return combined
+
+
+def _validate_unmsm_email(email: str) -> str:
+    clean_email = email.strip().lower()
+    if not clean_email.endswith("@unmsm.edu.pe"):
+        raise ValueError("El correo debe pertenecer al dominio institucional @unmsm.edu.pe")
+    return clean_email
 
 
 class ProjectCreateRequest(BaseModel):
-    title: str
-    course_name: str
-    cycle: str
-    semester: str = "2026-2"
+    title: str = Field(..., min_length=5, max_length=255)
+    course_name: str = Field(..., min_length=3, max_length=255)
+    cycle: str = Field(..., min_length=1, max_length=30)
     student_email: EmailStr
     teacher_email: EmailStr
 
+    @field_validator("student_email", "teacher_email")
+    @classmethod
+    def check_institutional_domain(cls, v: str) -> str:
+        return _validate_unmsm_email(v)
 
-@router.post("/", status_code=201)
-def create_project_draft(payload: ProjectCreateRequest):
-    """
-    HU03: Como estudiante, quiero registrar un proyecto asociado a un curso y docente
-    para incorporarlo a mi portafolio académico en estado 'Borrador'.
-    """
-    institutional_emails = (
-        is_institutional_email(str(payload.student_email)),
-        is_institutional_email(str(payload.teacher_email)),
+
+class ProjectSubmitReviewRequest(BaseModel):
+    tech_stack: List[str] = Field(
+        ...,
+        min_length=1,
+        description="Lista de tecnologías revisadas y editadas por el estudiante (Human-in-the-Loop)",
     )
-    if not all(institutional_emails):
-        raise HTTPException(
-            status_code=400,
-            detail="Tanto el correo del estudiante como el del docente deben pertenecer al dominio @unmsm.edu.pe"
-        )
+    professional_summary: str = Field(
+        ...,
+        min_length=20,
+        max_length=2500,
+        description="Resumen ejecutivo revisado y editado por el estudiante",
+    )
+    consent_law_29733: bool = Field(
+        ...,
+        description="Consentimiento expreso de la Ley N.° 29733 de Protección de Datos Personales",
+    )
 
+
+@router.post("/", status_code=201, summary="HU03: Registrar proyecto en estado Borrador")
+def create_project(payload: ProjectCreateRequest):
     project_id = str(uuid.uuid4())
-    new_project = {
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    project_record = {
         "id": project_id,
-        "title": payload.title,
-        "course_name": payload.course_name,
-        "cycle": payload.cycle,
-        "semester": payload.semester,
+        "title": payload.title.strip(),
+        "course_name": payload.course_name.strip(),
+        "cycle": payload.cycle.strip(),
+        "semester": "2026-2",
         "student_email": payload.student_email,
         "teacher_email": payload.teacher_email,
-        "status": "Borrador",  # Estado inicial exigido por HU03
+        "status": "Borrador",
         "github_url": None,
-        "extracted_evidence_text": None,
+        "extracted_evidence_text": "",
         "evidence_char_count": 0,
         "tech_stack": [],
-        "professional_summary": None,
+        "professional_summary": "",
         "consent_law_29733": False,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "consent_timestamp": None,
+        "submitted_at": None,
+        "opened_by_teacher_at": None,
+        "decision_at": None,
+        "active_review_seconds": None,
+        "teacher_feedback": None,
+        "created_at": now_iso,
     }
-    MOCK_PROJECTS_DB[project_id] = new_project
+    PROJECTS_DB[project_id] = project_record
     return {
-        "message": "Proyecto registrado exitosamente en estado Borrador (HU03).",
-        "project": new_project,
+        "message": "Proyecto creado exitosamente en estado Borrador",
+        "project": project_record,
     }
 
 
-@router.post("/{project_id}/evidences")
+@router.post(
+    "/{project_id}/evidences",
+    summary="HU04: Adjuntar URL de GitHub y/o archivos PDF/IPYNB y truncar texto",
+)
 async def upload_project_evidences(
     project_id: str,
-    github_url: str = Form(..., description="URL pública del repositorio de GitHub"),
-    evidence_file: Optional[UploadFile] = File(None, description="Reporte PDF o Notebook .ipynb opcional"),
+    github_url: Optional[str] = Form(None),
+    evidence_file: Optional[UploadFile] = File(None),
 ):
-    """
-    HU04: Adjunta evidencias al proyecto (GitHub, .ipynb o .pdf), verifica accesibilidad pública
-    y trunca el texto extraído para enviarlo al componente LLM (Módulo 3.3).
-    """
-    if project_id not in MOCK_PROJECTS_DB:
+    if project_id not in PROJECTS_DB:
         raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
 
-    # 1. Extraer texto desde el repositorio público de GitHub
-    github_text = extract_from_github(github_url)
-    combined_evidence = [github_text]
+    if not github_url and not evidence_file:
+        raise HTTPException(
+            status_code=400,
+            detail="Debes proporcionar al menos un enlace público de GitHub o un archivo (.pdf / .ipynb).",
+        )
 
-    # 2. Si el alumno adjuntó un PDF o Notebook (.ipynb), extraer también su contenido
-    if evidence_file and evidence_file.filename:
-        filename_lower = evidence_file.filename.lower()
+    extracted_blocks: List[str] = []
+
+    if github_url and github_url.strip():
+        gh_text = extract_from_github(github_url.strip())
+        extracted_blocks.append(gh_text)
+        PROJECTS_DB[project_id]["github_url"] = github_url.strip()
+
+    if evidence_file:
+        filename = (evidence_file.filename or "").lower()
         file_bytes = await evidence_file.read()
 
-        if filename_lower.endswith(".pdf"):
+        if filename.endswith(".pdf"):
             pdf_text = extract_from_pdf(file_bytes)
-            combined_evidence.append(f"\n=== CONTENIDO REPORTE PDF ({evidence_file.filename}) ===\n{pdf_text}")
-        elif filename_lower.endswith(".ipynb"):
-            ipynb_text = extract_from_ipynb(file_bytes)
-            combined_evidence.append(f"\n=== CONTENIDO NOTEBOOK ({evidence_file.filename}) ===\n{ipynb_text}")
+            extracted_blocks.append(f"ARCHIVO PDF ({evidence_file.filename}):\n{pdf_text}")
+        elif filename.endswith(".ipynb"):
+            nb_text = extract_from_ipynb(file_bytes)
+            extracted_blocks.append(f"JUPYTER NOTEBOOK ({evidence_file.filename}):\n{nb_text}")
         else:
             raise HTTPException(
                 status_code=400,
-                detail="Formato de archivo no soportado. Solo se admiten archivos .pdf o .ipynb"
+                detail="Formato de archivo no soportado. Solo se admiten archivos .pdf o .ipynb.",
             )
 
-    # 3. Aplicar truncado inteligente para proteger la cuota de tokens del LLM (R03)
-    final_clean_text = truncate_for_llm("\n".join(combined_evidence))
-
-    # 4. Guardar evidencia en el proyecto lista para que el módulo 3.3 (Erick) la procese con IA
-    project = MOCK_PROJECTS_DB[project_id]
-    project["github_url"] = github_url
-    project["extracted_evidence_text"] = final_clean_text
-    project["evidence_char_count"] = len(final_clean_text)
+    final_text = consolidate_and_truncate(extracted_blocks, max_chars=MAX_CHARS_FOR_LLM)
+    PROJECTS_DB[project_id]["extracted_evidence_text"] = final_text
+    PROJECTS_DB[project_id]["evidence_char_count"] = len(final_text)
 
     return {
-        "message": "Evidencias validadas y preprocesadas correctamente (HU04).",
+        "message": "Evidencias procesadas y truncadas exitosamente",
         "project_id": project_id,
-        "github_url": github_url,
-        "characters_extracted": len(final_clean_text),
-        "max_characters_allowed": MAX_CHARS_FOR_LLM,
-        "preview_for_llm": final_clean_text[:500] + "...",
+        "char_count": len(final_text),
+        "max_allowed_chars": MAX_CHARS_FOR_LLM,
+        "extracted_text_preview": final_text[:600],
+        "extracted_evidence_text": final_text,
     }
 
 
-@router.get("/")
-def list_projects():
-    """Lista todos los proyectos registrados para pruebas de integración."""
-    return list(MOCK_PROJECTS_DB.values())
+@router.put(
+    "/{project_id}/submit-review",
+    summary="HU06: Guardar edición Human-in-the-Loop, validar Ley N.° 29733 y enviar a Revisión Docente",
+)
+def submit_project_for_teacher_review(project_id: str, payload: ProjectSubmitReviewRequest):
+    if project_id not in PROJECTS_DB:
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
+
+    if not payload.consent_law_29733:
+        raise HTTPException(
+            status_code=400,
+            detail="Cumplimiento legal obligatorio: Debes aceptar el consentimiento de la Ley N.° 29733 para enviar el proyecto a revisión.",
+        )
+
+    clean_stack = [tech.strip() for tech in payload.tech_stack if tech.strip()]
+    if not clean_stack:
+        raise HTTPException(
+            status_code=400,
+            detail="El proyecto debe incluir al menos una tecnología validada por el estudiante.",
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    project = PROJECTS_DB[project_id]
+
+    project["tech_stack"] = clean_stack
+    project["professional_summary"] = payload.professional_summary.strip()
+    project["consent_law_29733"] = True
+    project["consent_timestamp"] = now_iso
+    project["status"] = "En Revisión"
+    project["submitted_at"] = now_iso
+
+    return {
+        "message": "Proyecto enviado exitosamente a la bandeja del docente titular (Estado: En Revisión).",
+        "project": project,
+    }
+
+
+@router.get(
+    "/student/{student_email}",
+    summary="Listar proyectos registrados por un estudiante",
+)
+def list_student_projects(student_email: str):
+    clean_email = student_email.strip().lower()
+    if not clean_email.endswith("@unmsm.edu.pe"):
+        raise HTTPException(
+            status_code=400,
+            detail="El correo consultado debe pertenecer al dominio @unmsm.edu.pe",
+        )
+
+    projects = [
+        p for p in PROJECTS_DB.values() if p["student_email"].lower() == clean_email
+    ]
+    return {
+        "student_email": clean_email,
+        "total": len(projects),
+        "projects": projects,
+    }
+
+
+@router.get("/{project_id}", summary="Obtener detalle completo de un proyecto por ID")
+def get_project_detail(project_id: str):
+    if project_id not in PROJECTS_DB:
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
+    return PROJECTS_DB[project_id]
