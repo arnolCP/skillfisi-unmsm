@@ -1,6 +1,7 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 
 export default function LoginPage() {
@@ -8,7 +9,15 @@ export default function LoginPage() {
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
   const router = useRouter();
+
+  // Aviso al llegar desde /registro con una cuenta recién creada.
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get('registro') === 'exitoso') {
+      setNotice('Cuenta creada correctamente. Ya puedes iniciar sesión con tu correo institucional.');
+    }
+  }, []);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -54,6 +63,12 @@ export default function LoginPage() {
           <p className="text-sm text-slate-500 mt-1">Plataforma de Portafolios Académicos UNMSM</p>
         </div>
 
+        {notice && !error && (
+          <div role="status" className="mb-4 p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-lg">
+            {notice}
+          </div>
+        )}
+
         {error && (
           <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-700 text-xs rounded-lg">
             {error}
@@ -97,6 +112,13 @@ export default function LoginPage() {
             {loading ? 'Validando...' : 'Iniciar Sesión'}
           </button>
         </form>
+
+        <p className="mt-4 text-center text-sm text-slate-600">
+          ¿No tienes cuenta?{' '}
+          <Link href="/registro" className="font-medium text-blue-700 hover:text-blue-800 hover:underline">
+            Regístrate
+          </Link>
+        </p>
 
         <div className="mt-6 border-t border-slate-100 pt-4 text-center">
           <p className="text-xs text-slate-400">
