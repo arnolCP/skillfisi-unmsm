@@ -1,40 +1,45 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from services.llm_service import llm_adapter, AIExtractionSchema  # <-- Sin "backend." al inicio
+from typing import List, Optional, Dict, Any
+from services.llm_service import llm_service
 
-router = APIRouter(
-    prefix="/api/v1/llm",
-    tags=["Módulo 3.3 - Extracción con IA (LLM)"]
-)
+router = APIRouter()
+
 
 class EvidenceExtractionRequest(BaseModel):
-    project_id: str | None = Field(
-        default=None,
-        description="UUID opcional del proyecto registrado en estado Borrador."
-    )
-    extracted_evidence_text: str = Field(
-        ...,
-        min_length=10,
-        description="Texto limpio preprocesado por el módulo 3.2 (GitHub, PDF o Notebook)."
-    )
+    project_id: Optional[str] = None
+    extracted_evidence_text: str = Field(..., min_length=10)
 
-@router.post(
-    "/extract",
-    response_model=AIExtractionSchema,
-    status_code=status.HTTP_200_OK,
-    summary="Extrae stack tecnológico y resumen profesional mediante LLM"
-)
-async def extract_project_technologies(payload: EvidenceExtractionRequest) -> AIExtractionSchema:
+
+class ExtractionResponse(BaseModel):
+    project_id: Optional[str] = None
+    stack_tecnologico: List[str]
+    resumen_profesional: str
+    cached: bool
+    evidence_hash: str
+
+
+@router.post("/extract", response_model=ExtractionResponse)
+def extract_project_technologies(payload: EvidenceExtractionRequest):
     try:
-        result = llm_adapter.extract_skills_and_summary(payload.extracted_evidence_text)
-        return result
-    except ValueError as ve:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(ve)
+        extraction_result = llm_service.extract_skills_and_summary(
+            payload.extracted_evidence_text
         )
+        data = extraction_result["data"]
+        return ExtractionResponse(
+            project_id=payload.project_id,
+            stack_tecnologico=data["stack_tecnologico"],
+            resumen_profesional=data["resumen_profesional"],
+            cached=extraction_result["cached"],
+            evidence_hash=extraction_result["hash"],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error al procesar la evidencia con el motor LLM: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error en procesamiento LLM: {str(e)}")
+
+
+@router.get("/cache/metrics")
+def get_llm_cache_metrics() -> Dict[str, Any]:
+    """Retorna telemetría del caché SHA-256 (hits, misses y tasa de aciertos)."""
+    return llm_service.get_cache_metrics()

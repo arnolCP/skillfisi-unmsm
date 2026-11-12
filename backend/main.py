@@ -1,13 +1,14 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import auth_profiles, projects, llm_extraction, teacher_reviews
+from routers import auth_profiles, projects, llm_extraction
 
 app = FastAPI(
     title="SkillFISI API - UNMSM",
     description="API REST para Gestión de Portafolios Académicos, Extracción IA y Validación Docente (FISI - UNMSM)",
-    version="1.2.0",
+    version="2.0.0",
 )
 
+# Configuración CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "*"],
@@ -16,13 +17,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth_profiles.router)
-app.include_router(projects.router)
-app.include_router(llm_extraction.router)
-app.include_router(teacher_reviews.router)
+# 1. Módulo 3.1 - Autenticación y Perfiles
+app.include_router(auth_profiles.router, prefix="/api/v1/auth", tags=["Módulo 3.1 - Autenticación"])
 
+# 2. Módulo 3.2 - Registro de Proyectos y Evidencias
+app.include_router(projects.router, prefix="/api/v1/projects", tags=["Módulo 3.2 - Proyectos"])
 
-@app.get("/", tags=["Monitoreo de Salud"])
+# 3. Módulo 3.3 - Extracción con IA y Métricas de Caché (Erick)
+app.include_router(llm_extraction.router, prefix="/api/v1/llm", tags=["Módulo 3.3 - Extracción con IA"])
+
+# 4. Módulo 3.2 / HU07 - Bandeja y Revisión Docente HITL (Arnol)
+try:
+    from routers import teacher_reviews
+    app.include_router(teacher_reviews.router, prefix="/api/v1/teacher", tags=["Validación Docente (HITL)"])
+except ImportError:
+    pass
+
+@app.get("/", tags=["Health Check"])
 def health_check():
     return {
         "status": "online",
