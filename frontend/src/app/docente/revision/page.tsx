@@ -6,11 +6,10 @@ interface PendingProject {
   id: string;
   title: string;
   course_name: string;
-  student_name: string;
   student_email: string;
-  github_url: string;
-  resumen_profesional: string;
-  stack_tecnologico: string[];
+  github_url: string | null;
+  professional_summary: string;
+  tech_stack: string[];
   submitted_at: string;
 }
 
@@ -35,43 +34,14 @@ export default function DocenteRevisionPage() {
     setLoading(true);
     try {
       const token = localStorage.getItem('token');
-      const res = await fetch(`${API_URL}/api/v1/projects/pending-review`, {
+      const res = await fetch(`${API_URL}/api/v1/reviews/pending`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      if (res.ok) {
-        const data = await res.json();
-        setProjects(data);
-      } else {
-        // Datos de ejemplo para desarrollo si el backend local no tiene registros
-        setProjects([
-          {
-            id: 'p-001',
-            title: 'Sistema de Gestión de Almacenes Inteligente',
-            course_name: 'Taller de Construcción de Software',
-            student_name: 'Carlos Mendoza',
-            student_email: 'carlos.mendoza@unmsm.edu.pe',
-            github_url: 'https://github.com/carlosm/almacen-unmsm',
-            resumen_profesional: 'Aplicación web completa desarrollada para optimizar la trazabilidad de inventarios mediante arquitectura hexagonal, control de stock en tiempo real y endpoints REST de alta concurrencia.',
-            stack_tecnologico: ['FastAPI', 'Python', 'PostgreSQL', 'Docker', 'Next.js', 'Tailwind CSS'],
-            submitted_at: new Date().toISOString(),
-          },
-        ]);
-      }
+      if (!res.ok) throw new Error('No se pudo cargar la bandeja docente.');
+      const data = await res.json();
+      setProjects(data.projects);
     } catch {
-      // Fallback a proyectos demo para visualización en frontend
-      setProjects([
-        {
-          id: 'p-001',
-          title: 'Sistema de Gestión de Almacenes Inteligente',
-          course_name: 'Taller de Construcción de Software',
-          student_name: 'Carlos Mendoza',
-          student_email: 'carlos.mendoza@unmsm.edu.pe',
-          github_url: 'https://github.com/carlosm/almacen-unmsm',
-          resumen_profesional: 'Aplicación web completa desarrollada para optimizar la trazabilidad de inventarios mediante arquitectura hexagonal, control de stock en tiempo real y endpoints REST de alta concurrencia.',
-          stack_tecnologico: ['FastAPI', 'Python', 'PostgreSQL', 'Docker', 'Next.js', 'Tailwind CSS'],
-          submitted_at: new Date().toISOString(),
-        },
-      ]);
+      setStatusMessage({ type: 'error', text: 'No se pudo cargar la bandeja docente.' });
     } finally {
       setLoading(false);
     }
@@ -90,52 +60,58 @@ export default function DocenteRevisionPage() {
 
   // 3. Apertura de revisión y disparo de telemetría (/open)
   const handleOpenProject = async (project: PendingProject) => {
-    setSelectedProject(project);
-    setFeedback('');
-    setActiveSeconds(0);
-    setTimerRunning(true);
+    if (actionLoading) return;
+    setActionLoading(true);
     setStatusMessage(null);
 
     try {
       const token = localStorage.getItem('token');
-      await fetch(`${API_URL}/api/v1/projects/${project.id}/open`, {
+      const res = await fetch(`${API_URL}/api/v1/reviews/${project.id}/open`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
       });
+      if (!res.ok) throw new Error('No se pudo iniciar la revisión.');
+      const data = await res.json();
+      const elapsed = Math.floor((Date.now() - Date.parse(data.opened_by_teacher_at)) / 1000);
+      setSelectedProject(project);
+      setFeedback('');
+      setActiveSeconds(Math.max(0, elapsed));
+      setTimerRunning(true);
     } catch {
-      // Registro de apertura silencioso
+      setStatusMessage({ type: 'error', text: 'No se pudo iniciar la revisión.' });
+    } finally {
+      setActionLoading(false);
     }
   };
 
   // 4. Emisión de dictamen: Validar u Observar
   const handleDecision = async (decision: 'Validado' | 'Observado') => {
     if (!selectedProject) return;
-    if (decision === 'Observado' && !feedback.trim()) {
-      setStatusMessage({ type: 'error', text: 'Por favor, ingrese el motivo de la observación para el alumno.' });
+    if (decision === 'Observado' && feedback.trim().length < 5) {
+      setStatusMessage({ type: 'error', text: 'Ingrese un motivo de al menos cinco caracteres.' });
       return;
     }
 
     setActionLoading(true);
-    setTimerRunning(false);
 
     try {
       const token = localStorage.getItem('token');
-      const res = await fetch(`${API_URL}/api/v1/projects/${selectedProject.id}/decision`, {
+      const res = await fetch(`${API_URL}/api/v1/reviews/${selectedProject.id}/decision`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
-          status: decision,
+          decision,
           teacher_feedback: feedback,
-          active_review_seconds: activeSeconds,
         }),
       });
 
       if (!res.ok) {
         throw new Error('Error al registrar la decisión');
       }
+      setTimerRunning(false);
 
       setStatusMessage({
         type: 'success',
@@ -222,17 +198,17 @@ export default function DocenteRevisionPage() {
                     </span>
                   </div>
                   <h3 className="text-sm font-bold text-slate-800 mb-1">{p.title}</h3>
-                  <p className="text-xs text-slate-500 mb-3">Estudiante: {p.student_name}</p>
+                  <p className="text-xs text-slate-500 mb-3">Estudiante: {p.student_email}</p>
                   
                   <div className="flex flex-wrap gap-1">
-                    {p.stack_tecnologico?.slice(0, 4).map((tech, i) => (
+                    {p.tech_stack.slice(0, 4).map((tech, i) => (
                       <span key={i} className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded">
                         {tech}
                       </span>
                     ))}
-                    {p.stack_tecnologico?.length > 4 && (
+                    {p.tech_stack.length > 4 && (
                       <span className="text-[10px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded">
-                        +{p.stack_tecnologico.length - 4}
+                        +{p.tech_stack.length - 4}
                       </span>
                     )}
                   </div>
@@ -273,12 +249,12 @@ export default function DocenteRevisionPage() {
                     Evidencia Técnica Principal (GitHub)
                   </label>
                   <a
-                    href={selectedProject.github_url}
+                    href={selectedProject.github_url ?? undefined}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="inline-flex items-center text-xs font-medium text-blue-700 hover:text-blue-800 hover:underline"
                   >
-                    <span>{selectedProject.github_url}</span>
+                    <span>{selectedProject.github_url ?? 'Sin repositorio adjunto'}</span>
                     <svg className="w-3.5 h-3.5 ml-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
                     </svg>
@@ -291,7 +267,7 @@ export default function DocenteRevisionPage() {
                     Resumen Ejecutivo (Extraído por LLM)
                   </label>
                   <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs leading-relaxed text-slate-700">
-                    {selectedProject.resumen_profesional}
+                    {selectedProject.professional_summary}
                   </div>
                 </div>
 
@@ -301,7 +277,7 @@ export default function DocenteRevisionPage() {
                     Stack Tecnológico Detectado
                   </label>
                   <div className="flex flex-wrap gap-1.5">
-                    {selectedProject.stack_tecnologico?.map((tech, idx) => (
+                    {selectedProject.tech_stack.map((tech, idx) => (
                       <span
                         key={idx}
                         className="px-2.5 py-1 bg-blue-50 text-blue-700 border border-blue-200 rounded-md text-xs font-medium"
