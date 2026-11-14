@@ -17,6 +17,7 @@ class LLMAdapterService:
     def __init__(self):
         self.api_key = os.getenv("LLM_API_KEY", "")
         self.provider = os.getenv("LLM_PROVIDER", "gemini")
+        self.model = os.getenv("LLM_MODEL", "gemini-3.5-flash")
         self.max_chars = 12000
         # Almacén de caché en memoria y métricas
         self._cache: Dict[str, Dict[str, Any]] = {}
@@ -105,7 +106,7 @@ Salida JSON:
 
         client = genai.Client(api_key=self.api_key)
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model=self.model,
             contents=f"Evidencia técnica del proyecto:\n\n{safe_text}",
             config=types.GenerateContentConfig(
                 system_instruction=self._build_calibrated_prompt(),
