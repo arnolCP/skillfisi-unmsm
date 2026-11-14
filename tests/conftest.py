@@ -7,3 +7,7 @@ aunque exista backend/.env con credenciales reales.
 import os
 
 os.environ["SKILLFISI_PERSISTENCE"] = "local"
+
+
+def pytest_addoption(parser):
+    parser.addoption("--gemini-live", action="store_true", help="Ejecutar la evaluación con Gemini.")
