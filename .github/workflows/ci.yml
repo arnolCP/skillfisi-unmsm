@@ -3,6 +3,12 @@ name: Pruebas de calidad
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      evaluate_gemini:
+        description: Evaluar el Golden Dataset con Gemini (10 solicitudes)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -33,3 +39,9 @@ jobs:
 
       - name: Ejecutar pruebas
         run: python -m pytest --quiet
+
+      - name: Evaluar Golden Dataset con Gemini
+        if: github.event_name == 'workflow_dispatch' && inputs.evaluate_gemini
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: python -m pytest -q -s --gemini-live tests/test_sprint2_hitl_and_review.py -k golden_dataset_gemini
