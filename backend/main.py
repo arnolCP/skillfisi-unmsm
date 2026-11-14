@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import auth_profiles, projects, llm_extraction
+from routers import auth_profiles, llm_extraction, projects, teacher_reviews
 
 app = FastAPI(
     title="SkillFISI API - UNMSM",
@@ -18,20 +18,16 @@ app.add_middleware(
 )
 
 # 1. Módulo 3.1 - Autenticación y Perfiles
-app.include_router(auth_profiles.router, prefix="/api/v1/auth", tags=["Módulo 3.1 - Autenticación"])
+app.include_router(auth_profiles.router)
 
 # 2. Módulo 3.2 - Registro de Proyectos y Evidencias
-app.include_router(projects.router, prefix="/api/v1/projects", tags=["Módulo 3.2 - Proyectos"])
+app.include_router(projects.router)
 
 # 3. Módulo 3.3 - Extracción con IA y Métricas de Caché (Erick)
 app.include_router(llm_extraction.router, prefix="/api/v1/llm", tags=["Módulo 3.3 - Extracción con IA"])
 
 # 4. Módulo 3.2 / HU07 - Bandeja y Revisión Docente HITL (Arnol)
-try:
-    from routers import teacher_reviews
-    app.include_router(teacher_reviews.router, prefix="/api/v1/teacher", tags=["Validación Docente (HITL)"])
-except ImportError:
-    pass
+app.include_router(teacher_reviews.router)
 
 @app.get("/", tags=["Health Check"])
 def health_check():

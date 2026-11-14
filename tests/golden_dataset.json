@@ -1,0 +1,114 @@
+[
+  {
+    "id": "inventario-web",
+    "category": "web",
+    "evidence_text": "README: El inventario usa TypeScript en Next.js y Tailwind CSS. El archivo compose levanta PostgreSQL y Docker empaqueta la aplicación.",
+    "expected_technologies": [
+      "TypeScript",
+      "Next.js",
+      "Tailwind CSS",
+      "PostgreSQL",
+      "Docker"
+    ]
+  },
+  {
+    "id": "clasificador-residuos",
+    "category": "ia",
+    "evidence_text": "Notebook: import pandas as pd; from sklearn.ensemble import RandomForestClassifier. El entrenamiento en Python consolida etiquetas y compara modelos.",
+    "expected_technologies": [
+      "Python",
+      "pandas",
+      "scikit-learn"
+    ]
+  },
+  {
+    "id": "turnos-mobile",
+    "category": "movil",
+    "evidence_text": "pubspec.yaml declara Flutter y firebase_auth. El código Dart autentica estudiantes mediante Firebase Authentication. Kotlin figura como alternativa descartada.",
+    "expected_technologies": [
+      "Flutter",
+      "Dart",
+      "Firebase Authentication"
+    ]
+  },
+  {
+    "id": "invernadero-iot",
+    "category": "iot",
+    "evidence_text": "El ESP32 mide humedad. El firmware está escrito en C++ con Arduino y publica lecturas mediante el cliente Eclipse Paho en un canal MQTT.",
+    "expected_technologies": [
+      "ESP32",
+      "C++",
+      "Arduino",
+      "Eclipse Paho",
+      "MQTT"
+    ]
+  },
+  {
+    "id": "pipeline-cloud",
+    "category": "cloud",
+    "evidence_text": "El pipeline de GitHub Actions ejecuta Terraform para aprovisionar AWS Lambda y Amazon S3. GitHub Actions también ejecuta las pruebas antes del despliegue.",
+    "expected_technologies": [
+      "GitHub Actions",
+      "Terraform",
+      "AWS Lambda",
+      "Amazon S3"
+    ]
+  },
+  {
+    "id": "biblioteca-datos",
+    "category": "base-de-datos",
+    "evidence_text": "La biblioteca guarda préstamos en SQLite. Las migraciones se ejecutan mediante SQLAlchemy y la API de consultas se implementa con Flask y Python.",
+    "expected_technologies": [
+      "SQLite",
+      "SQLAlchemy",
+      "Flask",
+      "Python"
+    ]
+  },
+  {
+    "id": "matricula-web",
+    "category": "web",
+    "evidence_text": "package.json: react, vite y typescript. La API de matrícula utiliza Java con Spring Boot. Redis se evaluó y no se incorporó.",
+    "expected_technologies": [
+      "React",
+      "Vite",
+      "TypeScript",
+      "Java",
+      "Spring Boot"
+    ]
+  },
+  {
+    "id": "lectura-matriculas",
+    "category": "ia",
+    "evidence_text": "La práctica de visión artificial ejecuta Python con PyTorch y OpenCV. NumPy convierte las imágenes a matrices antes del entrenamiento.",
+    "expected_technologies": [
+      "Python",
+      "PyTorch",
+      "OpenCV",
+      "NumPy"
+    ]
+  },
+  {
+    "id": "rutas-campus",
+    "category": "movil",
+    "evidence_text": "build.gradle.kts registra Jetpack Compose y Room. La aplicación Android usa Kotlin y permite consultar los mapas guardados sin conexión.",
+    "expected_technologies": [
+      "Jetpack Compose",
+      "Room",
+      "Android",
+      "Kotlin"
+    ]
+  },
+  {
+    "id": "observatorio-metricas",
+    "category": "cloud",
+    "evidence_text": "La instalación de Kubernetes utiliza Helm. Prometheus recoge métricas y Grafana publica los paneles. PostgreSQL almacena el catálogo de servicios.",
+    "expected_technologies": [
+      "Kubernetes",
+      "Helm",
+      "Prometheus",
+      "Grafana",
+      "PostgreSQL"
+    ]
+  }
+]

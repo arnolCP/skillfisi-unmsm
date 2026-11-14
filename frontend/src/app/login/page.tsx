@@ -47,7 +47,7 @@ export default function LoginPage() {
       localStorage.setItem('token', data.access_token);
       localStorage.setItem('user_id', data.user.id);
       
-      router.push('/perfil');
+      router.push(data.user.role === 'Docente' ? '/docente/revision' : '/perfil');
     } catch (err: any) {
       setError(err.message || 'Error al conectar con el servidor');
     } finally {

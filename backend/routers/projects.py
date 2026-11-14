@@ -178,8 +178,11 @@ def submit_project_for_teacher_review(project_id: str, payload: ProjectSubmitRev
             detail="El proyecto debe incluir al menos una tecnología validada por el estudiante.",
         )
 
-    now_iso = datetime.now(timezone.utc).isoformat()
     project = PROJECTS_DB[project_id]
+    if project["status"] not in {"Borrador", "Observado"}:
+        raise HTTPException(status_code=409, detail="Solo se pueden enviar proyectos en Borrador u Observado.")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     project["tech_stack"] = clean_stack
     project["professional_summary"] = payload.professional_summary.strip()
@@ -187,6 +190,10 @@ def submit_project_for_teacher_review(project_id: str, payload: ProjectSubmitRev
     project["consent_timestamp"] = now_iso
     project["status"] = "En Revisión"
     project["submitted_at"] = now_iso
+    project["opened_by_teacher_at"] = None
+    project["decision_at"] = None
+    project["active_review_seconds"] = None
+    project["teacher_feedback"] = None
 
     return {
         "message": "Proyecto enviado exitosamente a la bandeja del docente titular (Estado: En Revisión).",
