@@ -1,20 +1,22 @@
-from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel, EmailStr, Field, field_validator
-from typing import Optional, List, Literal
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from typing import Annotated, Optional, List, Literal
 from datetime import datetime, timezone
+from math import ceil
 
+from routers.auth_profiles import AuthorizedUser, require_role
 from routers.projects import PROJECTS_DB
+from services.quality_metrics import MAX_TEACHER_ACTIVE_SECONDS, teacher_active_time_seconds
 
 router = APIRouter(
     prefix="/api/v1/reviews",
     tags=["Módulo 3.4 - Validación Docente SLA <= 5 min (HU07)"],
 )
 
-SLA_MAX_REVIEW_SECONDS = 300  # 5 minutos (300 segundos)
+TeacherUser = Annotated[AuthorizedUser, Depends(require_role("Docente"))]
 
 
 class TeacherDecisionRequest(BaseModel):
-    teacher_email: EmailStr
     decision: Literal["Validado", "Observado"]
     teacher_feedback: Optional[str] = Field(
         default=None,
@@ -26,43 +28,27 @@ class TeacherDecisionRequest(BaseModel):
         description="Lista final de tecnologías acreditadas por el docente",
     )
 
-    @field_validator("teacher_email")
-    @classmethod
-    def check_teacher_domain(cls, v: str) -> str:
-        clean = v.strip().lower()
-        if not clean.endswith("@unmsm.edu.pe"):
-            raise ValueError("El docente debe utilizar su correo institucional @unmsm.edu.pe")
-        return clean
+def _assigned_project(project_id: str, teacher: AuthorizedUser) -> dict:
+    project = PROJECTS_DB.get(project_id)
+    if project is None or project["teacher_email"].casefold() != teacher.email.casefold():
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
+    return project
 
 
 @router.get(
     "/pending",
     summary="HU07: Listar proyectos pendientes en la bandeja del docente ('En Revisión')",
 )
-def get_pending_reviews(
-    teacher_email: Optional[str] = Query(
-        default=None,
-        description="Filtrar por correo institucional del docente (@unmsm.edu.pe)",
-    )
-):
+def get_pending_reviews(teacher: TeacherUser):
     pending = [
-        p for p in PROJECTS_DB.values() if p.get("status") == "En Revisión"
+        p for p in PROJECTS_DB.values()
+        if p["status"] == "En Revisión"
+        and p["teacher_email"].casefold() == teacher.email.casefold()
     ]
-
-    if teacher_email:
-        clean_teacher = teacher_email.strip().lower()
-        if not clean_teacher.endswith("@unmsm.edu.pe"):
-            raise HTTPException(
-                status_code=400,
-                detail="El correo del docente debe pertenecer al dominio @unmsm.edu.pe",
-            )
-        pending = [
-            p for p in pending if p.get("teacher_email", "").lower() == clean_teacher
-        ]
 
     return {
         "total_pending": len(pending),
-        "sla_target_seconds": SLA_MAX_REVIEW_SECONDS,
+        "sla_target_seconds": MAX_TEACHER_ACTIVE_SECONDS,
         "projects": pending,
     }
 
@@ -71,25 +57,22 @@ def get_pending_reviews(
     "/{project_id}/open",
     summary="HU07 Telemetría: Registrar inicio de revisión activa en pantalla (opened_by_teacher_at)",
 )
-def mark_project_opened_by_teacher(project_id: str):
-    if project_id not in PROJECTS_DB:
-        raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
-
-    project = PROJECTS_DB[project_id]
+def mark_project_opened_by_teacher(project_id: str, teacher: TeacherUser):
+    project = _assigned_project(project_id, teacher)
     if project["status"] != "En Revisión":
         raise HTTPException(
             status_code=400,
             detail=f"El proyecto debe estar 'En Revisión' para iniciar evaluación (estado actual: {project['status']}).",
         )
 
-    opened_at_iso = datetime.now(timezone.utc).isoformat()
-    project["opened_by_teacher_at"] = opened_at_iso
+    if project["opened_by_teacher_at"] is None:
+        project["opened_by_teacher_at"] = datetime.now(timezone.utc).isoformat()
 
     return {
         "message": "Inicio de revisión docente registrado para telemetría SLA.",
         "project_id": project_id,
-        "opened_by_teacher_at": opened_at_iso,
-        "sla_limit_seconds": SLA_MAX_REVIEW_SECONDS,
+        "opened_by_teacher_at": project["opened_by_teacher_at"],
+        "sla_limit_seconds": MAX_TEACHER_ACTIVE_SECONDS,
     }
 
 
@@ -97,11 +80,8 @@ def mark_project_opened_by_teacher(project_id: str):
     "/{project_id}/decision",
     summary="HU07: Emitir veredicto docente ('Validado' u 'Observado') y calcular SLA <= 300s",
 )
-def submit_teacher_decision(project_id: str, payload: TeacherDecisionRequest):
-    if project_id not in PROJECTS_DB:
-        raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
-
-    project = PROJECTS_DB[project_id]
+def submit_teacher_decision(project_id: str, payload: TeacherDecisionRequest, teacher: TeacherUser):
+    project = _assigned_project(project_id, teacher)
     if project["status"] != "En Revisión":
         raise HTTPException(
             status_code=400,
@@ -119,13 +99,10 @@ def submit_teacher_decision(project_id: str, payload: TeacherDecisionRequest):
     now_dt = datetime.now(timezone.utc)
     decision_at_iso = now_dt.isoformat()
 
-    # Si no se llamó antes a /open, tomamos una apertura por defecto para calcular la telemetría
-    if project.get("opened_by_teacher_at"):
-        opened_dt = datetime.fromisoformat(project["opened_by_teacher_at"])
-        elapsed_seconds = max(1, int((now_dt - opened_dt).total_seconds()))
-    else:
-        project["opened_by_teacher_at"] = decision_at_iso
-        elapsed_seconds = 1
+    if project["opened_by_teacher_at"] is None:
+        raise HTTPException(status_code=409, detail="Abre el proyecto antes de emitir una decisión.")
+    opened_dt = datetime.fromisoformat(project["opened_by_teacher_at"])
+    elapsed_seconds = ceil(teacher_active_time_seconds(opened_dt, now_dt))
 
     if payload.validated_technologies is not None:
         clean_techs = [t.strip() for t in payload.validated_technologies if t.strip()]
@@ -139,7 +116,7 @@ def submit_teacher_decision(project_id: str, payload: TeacherDecisionRequest):
         payload.teacher_feedback.strip() if payload.teacher_feedback else "Acreditación conforme."
     )
 
-    sla_compliant = elapsed_seconds <= SLA_MAX_REVIEW_SECONDS
+    sla_compliant = elapsed_seconds <= MAX_TEACHER_ACTIVE_SECONDS
 
     return {
         "message": f"Proyecto '{payload.decision}' exitosamente por el docente.",
@@ -150,7 +127,7 @@ def submit_teacher_decision(project_id: str, payload: TeacherDecisionRequest):
             "opened_by_teacher_at": project.get("opened_by_teacher_at"),
             "decision_at": decision_at_iso,
             "active_review_seconds": elapsed_seconds,
-            "sla_max_seconds": SLA_MAX_REVIEW_SECONDS,
+            "sla_max_seconds": MAX_TEACHER_ACTIVE_SECONDS,
             "sla_compliant": sla_compliant,
         },
         "project": project,
