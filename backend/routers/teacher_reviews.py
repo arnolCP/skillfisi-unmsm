@@ -110,6 +110,12 @@ def submit_teacher_decision(project_id: str, payload: TeacherDecisionRequest, te
             project["tech_stack"] = clean_techs
 
     project["status"] = payload.decision
+
+    if payload.decision == "Validado":
+        project["verification_code"] = f"FISI-2026-{str(project_id).replace('-', '').upper()[:6]}"
+    else:
+        project["verification_code"] = None
+    
     project["decision_at"] = decision_at_iso
     project["active_review_seconds"] = elapsed_seconds
     project["teacher_feedback"] = (
@@ -131,4 +137,39 @@ def submit_teacher_decision(project_id: str, payload: TeacherDecisionRequest, te
             "sla_compliant": sla_compliant,
         },
         "project": project,
+    }
+
+@router.get(
+    "/{project_id}/seal",
+    summary="HU10: Consultar el Sello Oficial 'Validado por Docente' de un proyecto acreditado",
+)
+def get_project_official_seal(project_id: str):
+    if project_id not in PROJECTS_DB:
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
+
+    project = PROJECTS_DB[project_id]
+    if project.get("status") != "Validado":
+        raise HTTPException(
+            status_code=400,
+            detail=f"El proyecto aún no cuenta con el sello 'Validado por Docente' (estado actual: {project.get('status')}).",
+        )
+
+    seal_code = (
+        project.get("verification_code")
+        or f"FISI-2026-{str(project_id).replace('-', '').upper()[:6]}"
+    )
+    project["verification_code"] = seal_code
+
+    return {
+        "project_id": project_id,
+        "status": "Validado",
+        "official_seal": {
+            "badge": "Validado por Docente - FISI UNMSM",
+            "verification_code": seal_code,
+            "course_name": project.get("course_name"),
+            "validated_by_teacher": project.get("teacher_email"),
+            "validated_at": project.get("decision_at"),
+            "active_review_seconds": project.get("active_review_seconds"),
+            "validated_technologies": project.get("tech_stack", []),
+        },
     }

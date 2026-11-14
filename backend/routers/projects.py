@@ -228,3 +228,51 @@ def get_project_detail(project_id: str):
     if project_id not in PROJECTS_DB:
         raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
     return PROJECTS_DB[project_id]
+
+@router.put(
+    "/{project_id}/resubmit",
+    summary="HU08: Subsanar observaciones del docente y reenviar proyecto a 'En Revisión'",
+)
+def resubmit_observed_project(project_id: str, payload: ProjectSubmitReviewRequest):
+    if project_id not in PROJECTS_DB:
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
+
+    project = PROJECTS_DB[project_id]
+    if project.get("status") not in {"Observado", "Borrador", "En Revisión"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Solo se pueden subsanar proyectos en estado 'Observado' o 'Borrador' (estado actual: {project.get('status')}).",
+        )
+
+    if not payload.consent_law_29733:
+        raise HTTPException(
+            status_code=400,
+            detail="Cumplimiento legal obligatorio: Debes aceptar el consentimiento de la Ley N.° 29733 para reenviar el proyecto.",
+        )
+
+    clean_stack = [tech.strip() for tech in payload.tech_stack if tech.strip()]
+    if not clean_stack:
+        raise HTTPException(
+            status_code=400,
+            detail="El proyecto debe incluir al menos una tecnología validada por el estudiante.",
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    previous_feedback = project.get("teacher_feedback")
+
+    project["tech_stack"] = clean_stack
+    project["professional_summary"] = payload.professional_summary.strip()
+    project["consent_law_29733"] = True
+    project["consent_timestamp"] = now_iso
+    project["status"] = "En Revisión"
+    project["submitted_at"] = now_iso
+    project["previous_teacher_feedback"] = previous_feedback
+    project["teacher_feedback"] = None
+    project["opened_by_teacher_at"] = None
+    project["decision_at"] = None
+    project["active_review_seconds"] = None
+
+    return {
+        "message": "Proyecto subsanado y reenviado exitosamente a la bandeja del docente (Estado: En Revisión).",
+        "project": project,
+    }
