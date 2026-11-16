@@ -1,10 +1,11 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from typing import Optional, List, Dict
+from typing import Annotated, Optional, List, Dict
 from datetime import datetime, timezone
 import uuid
 
 import services.evidence_extractor as extractor
+from routers.auth_profiles import CurrentUser, get_current_user
 from services.evidence_extractor import (
     extract_from_github,
     extract_from_pdf,
@@ -182,6 +183,9 @@ def submit_project_for_teacher_review(project_id: str, payload: ProjectSubmitRev
     if project["status"] not in {"Borrador", "Observado"}:
         raise HTTPException(status_code=409, detail="Solo se pueden enviar proyectos en Borrador u Observado.")
 
+    if project["status"] == "Observado":
+        project["previous_teacher_feedback"] = project.get("teacher_feedback")
+
     now_iso = datetime.now(timezone.utc).isoformat()
 
     project["tech_stack"] = clean_stack
@@ -233,15 +237,22 @@ def get_project_detail(project_id: str):
     "/{project_id}/resubmit",
     summary="HU08: Subsanar observaciones del docente y reenviar proyecto a 'En Revisión'",
 )
-def resubmit_observed_project(project_id: str, payload: ProjectSubmitReviewRequest):
+def resubmit_observed_project(
+    project_id: str,
+    payload: ProjectSubmitReviewRequest,
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+):
     if project_id not in PROJECTS_DB:
         raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
 
     project = PROJECTS_DB[project_id]
-    if project.get("status") not in {"Observado", "Borrador", "En Revisión"}:
+    if project["student_email"].casefold() != current_user.email.casefold():
+        raise HTTPException(status_code=403, detail="Solo el estudiante titular puede subsanar el proyecto.")
+
+    if project["status"] != "Observado":
         raise HTTPException(
-            status_code=400,
-            detail=f"Solo se pueden subsanar proyectos en estado 'Observado' o 'Borrador' (estado actual: {project.get('status')}).",
+            status_code=409,
+            detail="Solo se pueden subsanar proyectos en estado 'Observado'.",
         )
 
     if not payload.consent_law_29733:
