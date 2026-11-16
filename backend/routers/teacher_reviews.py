@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
 from typing import Annotated, Optional, List, Literal
 from datetime import datetime, timezone
@@ -6,6 +6,7 @@ from math import ceil
 
 from routers.auth_profiles import AuthorizedUser, require_role
 from routers.projects import PROJECTS_DB
+from services.portfolio_privacy import PUBLIC_PORTFOLIO_HEADERS, is_public_project
 from services.quality_metrics import MAX_TEACHER_ACTIVE_SECONDS, teacher_active_time_seconds
 
 router = APIRouter(
@@ -143,22 +144,20 @@ def submit_teacher_decision(project_id: str, payload: TeacherDecisionRequest, te
     "/{project_id}/seal",
     summary="HU10: Consultar el Sello Oficial 'Validado por Docente' de un proyecto acreditado",
 )
-def get_project_official_seal(project_id: str):
-    if project_id not in PROJECTS_DB:
-        raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
-
-    project = PROJECTS_DB[project_id]
-    if project.get("status") != "Validado":
+def get_project_official_seal(project_id: str, response: Response):
+    project = PROJECTS_DB.get(project_id)
+    if project is None or not is_public_project(project):
         raise HTTPException(
-            status_code=400,
-            detail=f"El proyecto aún no cuenta con el sello 'Validado por Docente' (estado actual: {project.get('status')}).",
+            status_code=404,
+            detail="No hay un sello con publicación pública autorizada.",
+            headers=PUBLIC_PORTFOLIO_HEADERS,
         )
+    response.headers.update(PUBLIC_PORTFOLIO_HEADERS)
 
     seal_code = (
         project.get("verification_code")
         or f"FISI-2026-{str(project_id).replace('-', '').upper()[:6]}"
     )
-    project["verification_code"] = seal_code
 
     return {
         "project_id": project_id,
