@@ -11,7 +11,7 @@ from routers import (
 app = FastAPI(
     title="SkillFISI API - UNMSM",
     description="API REST para Gestión de Portafolios Académicos, Extracción IA, Validación Docente y Portafolio Público (FISI - UNMSM)",
-    version="2.1.0",
+    version="1.3.0",
 )
 
 # Configuración CORS
@@ -41,6 +41,7 @@ app.include_router(teacher_reviews.router)
 
 # 5. Módulo 3.5 / HU11 - Portafolio Profesional Público y Ley N.° 29733 (Arnol)
 app.include_router(public_portfolio.router)
+
 
 @app.get("/", tags=["Health Check"])
 def health_check():
