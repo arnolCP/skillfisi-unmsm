@@ -13,6 +13,7 @@ from services.evidence_extractor import (
 )
 
 MAX_CHARS_FOR_LLM = getattr(extractor, "MAX_CHARS_FOR_LLM", 12000)
+ProjectUser = Annotated[CurrentUser, Depends(get_current_user)]
 
 router = APIRouter(
     prefix="/api/v1/projects",
@@ -209,13 +210,15 @@ def submit_project_for_teacher_review(project_id: str, payload: ProjectSubmitRev
     "/student/{student_email}",
     summary="Listar proyectos registrados por un estudiante",
 )
-def list_student_projects(student_email: str):
+def list_student_projects(student_email: str, current_user: ProjectUser):
     clean_email = student_email.strip().lower()
     if not clean_email.endswith("@unmsm.edu.pe"):
         raise HTTPException(
             status_code=400,
             detail="El correo consultado debe pertenecer al dominio @unmsm.edu.pe",
         )
+    if current_user.email.casefold() != clean_email:
+        raise HTTPException(status_code=403, detail="Solo puedes listar tus propios proyectos.")
 
     projects = [
         p for p in PROJECTS_DB.values() if p["student_email"].lower() == clean_email
@@ -228,10 +231,18 @@ def list_student_projects(student_email: str):
 
 
 @router.get("/{project_id}", summary="Obtener detalle completo de un proyecto por ID")
-def get_project_detail(project_id: str):
-    if project_id not in PROJECTS_DB:
+def get_project_detail(project_id: str, current_user: ProjectUser):
+    project = PROJECTS_DB.get(project_id)
+    if project is None:
         raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
-    return PROJECTS_DB[project_id]
+    email = current_user.email.casefold()
+    is_owner = project["student_email"].casefold() == email
+    is_assigned_teacher = (
+        project["teacher_email"].casefold() == email and project["submitted_at"] is not None
+    )
+    if not (is_owner or is_assigned_teacher):
+        raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
+    return project
 
 @router.put(
     "/{project_id}/resubmit",
@@ -240,7 +251,7 @@ def get_project_detail(project_id: str):
 def resubmit_observed_project(
     project_id: str,
     payload: ProjectSubmitReviewRequest,
-    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    current_user: ProjectUser,
 ):
     if project_id not in PROJECTS_DB:
         raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
