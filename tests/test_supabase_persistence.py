@@ -1,12 +1,15 @@
 """Pruebas de la persistencia de proyectos (services/supabase_client.py) en modo local.
 
-El modo local aplica las mismas restricciones que database/02_sprint2_migration.sql,
-así que estas pruebas validan las reglas del flujo sin conectarse a Supabase.
+El modo local aplica las mismas restricciones que database/02_sprint2_migration.sql y
+database/04_sprint3_portfolio.sql, así que estas pruebas validan las reglas del flujo
+sin conectarse a Supabase.
 """
 
 import hashlib
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -208,7 +211,7 @@ def test_evidence_hash_is_sha256_of_trimmed_text():
 # ---------------------------------------------------------------------------
 # HU03: creación del proyecto
 # ---------------------------------------------------------------------------
-def test_insert_returns_draft_with_same_keys_as_projects_db(people):
+def test_insert_returns_draft_with_projects_db_keys_plus_sprint3_fields(people):
     from routers.projects import ProjectCreateRequest, create_project
 
     legacy = create_project(
@@ -223,7 +226,9 @@ def test_insert_returns_draft_with_same_keys_as_projects_db(people):
 
     project = new_project(student_email="  ALUMNO.QA@unmsm.edu.pe ")
 
-    assert set(project) == set(legacy)
+    assert set(project) == set(legacy) | {"verification_code", "consent_revoked_at"}
+    assert project["verification_code"] is None
+    assert project["consent_revoked_at"] is None
     assert project["status"] == "Borrador"
     assert project["student_email"] == STUDENT
     assert project["teacher_email"] == TEACHER
@@ -607,6 +612,11 @@ def test_list_pending_reviews_by_teacher_and_all(people, clock):
         ),
         (lambda t: {"evidence_hash": "ABC123"}, "projects_evidence_hash_check"),
         (lambda t: {"github_url": "javascript:alert(1)"}, "projects_github_url_check"),
+        # 04: fuera de 'Validado' rigen las reglas de consentimiento de la 02 y no hay sello
+        (lambda t: {"consent_law_29733": False}, "projects_consent_check"),
+        (lambda t: {"consent_revoked_at": t["submitted"] - timedelta(seconds=1)}, "projects_consent_revoked_check"),
+        (lambda t: {"verification_code": "fisi-2026-abc234"}, "projects_verification_code_check"),
+        (lambda t: {"verification_code": "FISI-2026-ABC234"}, "projects_verification_code_status_check"),
     ],
 )
 def test_local_store_enforces_database_check_constraints(people, clock, changes, constraint):
@@ -643,3 +653,341 @@ def test_local_store_enforces_unique_and_foreign_keys(people):
     assert (duplicated_email.value.code, duplicated_email.value.constraint) == ("23505", "users_email_key")
     assert (duplicated_course.value.code, duplicated_course.value.constraint) == ("23505", "courses_teacher_name_key")
     assert (missing_student.value.code, missing_student.value.constraint) == ("23503", "projects_student_id_fkey")
+
+
+# ---------------------------------------------------------------------------
+# Sprint 3 - HU10: código de verificación del sello docente
+# ---------------------------------------------------------------------------
+CODE_PATTERN = re.compile(r"FISI-2026-[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}")
+MIGRATION_04 = Path(__file__).resolve().parents[1] / "database" / "04_sprint3_portfolio.sql"
+
+
+def validated_project(clock, **overrides):
+    project = new_project(**overrides)
+    clock.advance(10)
+    submit(project["id"])
+    clock.advance(10)
+    sc.mark_project_opened(project["id"])
+    clock.advance(60)
+    teacher = overrides.get("teacher_email", TEACHER)
+    return sc.register_teacher_decision(project["id"], teacher_email=teacher, decision="Validado")
+
+
+def public_ids(identifier=STUDENT):
+    return [project["project_id"] for project in sc.get_public_portfolio_projects(identifier)["projects"]]
+
+
+def test_generated_verification_codes_follow_format():
+    codes = {sc.generate_verification_code() for _ in range(300)}
+
+    assert all(CODE_PATTERN.fullmatch(code) for code in codes)
+    assert len(codes) > 290
+
+
+def test_validation_generates_code_and_observation_does_not(people, clock):
+    validated = validated_project(clock)
+    opened = submitted_and_opened(clock)
+    observed = sc.register_teacher_decision(
+        opened["id"], teacher_email=TEACHER, decision="Observado", teacher_feedback="Falta documentar las pruebas."
+    )
+
+    assert CODE_PATTERN.fullmatch(validated["verification_code"])
+    assert sc.get_project(validated["id"])["verification_code"] == validated["verification_code"]
+    assert observed["verification_code"] is None
+
+
+def test_verification_code_retries_when_code_already_exists(people, clock, monkeypatch):
+    first = validated_project(clock)
+    candidates = iter([first["verification_code"], "FISI-2026-NEW234"])
+    generated = []
+
+    def next_code():
+        generated.append(next(candidates))
+        return generated[-1]
+
+    monkeypatch.setattr(sc, "generate_verification_code", next_code)
+    second = validated_project(clock, student_email=OTHER_STUDENT)
+
+    assert second["verification_code"] == "FISI-2026-NEW234"
+    assert generated == [first["verification_code"], "FISI-2026-NEW234"]
+
+
+def test_verification_code_gives_up_after_max_attempts_without_changes(people, clock, monkeypatch):
+    first = validated_project(clock)
+    opened = submitted_and_opened(clock)
+    original_generator = sc.generate_verification_code
+    attempts = []
+    monkeypatch.setattr(sc, "generate_verification_code", lambda: attempts.append(1) or first["verification_code"])
+
+    with pytest.raises(sc.DatabaseError) as error:
+        sc.register_teacher_decision(opened["id"], teacher_email=TEACHER, decision="Validado")
+
+    assert error.value.http_status == 503
+    assert len(attempts) == sc.MAX_VERIFICATION_CODE_ATTEMPTS
+    stored = sc.get_project(opened["id"])
+    assert (stored["status"], stored["verification_code"]) == ("En Revisión", None)
+
+    monkeypatch.setattr(sc, "generate_verification_code", original_generator)
+    retried = sc.register_teacher_decision(opened["id"], teacher_email=TEACHER, decision="Validado")
+    assert CODE_PATTERN.fullmatch(retried["verification_code"])
+
+
+# ---------------------------------------------------------------------------
+# Sprint 3 - HU11 / R06: consentimiento de publicación (Ley N.° 29733)
+# ---------------------------------------------------------------------------
+def test_revoking_consent_hides_project_immediately(people, clock):
+    validated = validated_project(clock)
+    assert public_ids() == [validated["id"]]
+    clock.advance(3600)
+
+    revoked = sc.update_project_privacy_consent(validated["id"], False, student_email="  ALUMNO.QA@unmsm.edu.pe ")
+
+    assert revoked["consent_law_29733"] is False
+    assert revoked["consent_revoked_at"] == clock.now.isoformat()
+    assert revoked["consent_timestamp"] == validated["consent_timestamp"]
+    assert revoked["status"] == "Validado"
+    assert revoked["verification_code"] == validated["verification_code"]
+    assert sc.get_project(validated["id"]) == revoked
+    with pytest.raises(sc.PortfolioNotFoundError):
+        sc.get_public_portfolio_projects(STUDENT)
+
+
+def test_consent_can_be_reactivated_and_keeps_last_revocation(people, clock):
+    validated = validated_project(clock)
+    clock.advance(60)
+    revoked = sc.update_project_privacy_consent(validated["id"], False)
+    clock.advance(60)
+
+    with pytest.raises(sc.DatabaseError) as without_new_date:
+        sc._local_backend.update_project(validated["id"], {"consent_law_29733": True})
+    active = sc.update_project_privacy_consent(validated["id"], True, student_email=STUDENT)
+
+    assert without_new_date.value.constraint == "projects_consent_check"
+    assert active["consent_law_29733"] is True
+    assert active["consent_timestamp"] == clock.now.isoformat()
+    assert active["consent_revoked_at"] == revoked["consent_revoked_at"]
+    assert public_ids() == [validated["id"]]
+
+
+def test_privacy_consent_with_same_value_changes_nothing(people, clock):
+    validated = validated_project(clock)
+    clock.advance(60)
+    assert sc.update_project_privacy_consent(validated["id"], True) == validated
+
+    revoked = sc.update_project_privacy_consent(validated["id"], False)
+    clock.advance(60)
+    assert sc.update_project_privacy_consent(validated["id"], False) == revoked
+
+
+@pytest.mark.parametrize("status", ["Borrador", "En Revisión", "Observado"])
+def test_privacy_consent_only_for_validated_projects(people, clock, status):
+    project = new_project()
+    if status != "Borrador":
+        submit(project["id"])
+    if status == "Observado":
+        sc.mark_project_opened(project["id"])
+        sc.register_teacher_decision(
+            project["id"], teacher_email=TEACHER, decision="Observado", teacher_feedback="Falta documentar las pruebas."
+        )
+    before = sc.get_project(project["id"])
+
+    with pytest.raises(sc.InvalidTransitionError) as error:
+        sc.update_project_privacy_consent(project["id"], False)
+
+    assert (error.value.current_status, error.value.http_status) == (status, 409)
+    assert sc.get_project(project["id"]) == before
+
+
+def test_privacy_consent_rejects_other_student_and_invalid_input(people, clock):
+    validated = validated_project(clock)
+
+    with pytest.raises(sc.NotAuthorizedError) as other_student:
+        sc.update_project_privacy_consent(validated["id"], False, student_email=OTHER_STUDENT)
+    for value in (None, "false", 0):
+        with pytest.raises(sc.ProjectValidationError):
+            sc.update_project_privacy_consent(validated["id"], value)
+    with pytest.raises(sc.ProjectNotFoundError):
+        sc.update_project_privacy_consent(str(uuid.uuid4()), False)
+
+    assert other_student.value.http_status == 403
+    assert sc.get_project(validated["id"]) == validated
+
+
+# ---------------------------------------------------------------------------
+# Sprint 3 - HU11: portafolio público
+# ---------------------------------------------------------------------------
+def test_public_portfolio_shows_only_validated_projects_with_active_consent(people, clock):
+    new_project(title="Proyecto en borrador")
+    submit(new_project(title="Proyecto en revisión")["id"])
+    observed = submitted_and_opened(clock)
+    sc.register_teacher_decision(
+        observed["id"], teacher_email=TEACHER, decision="Observado", teacher_feedback="Falta documentar las pruebas."
+    )
+    revoked = validated_project(clock, title="Proyecto validado y revocado")
+    sc.update_project_privacy_consent(revoked["id"], False)
+    visible = validated_project(clock, title="Proyecto validado visible")
+    validated_project(clock, student_email=OTHER_STUDENT)
+
+    assert public_ids() == [visible["id"]]
+
+
+def test_public_portfolio_returns_only_public_data_without_emails(people, clock):
+    graduate = sc.register_local_user(
+        email="egresada.qa@unmsm.edu.pe",
+        full_name="Egresada QA",
+        school="Ingeniería de Software",
+        current_cycle=9,
+        linkedin_url="https://www.linkedin.com/in/egresada-qa",
+        github_url="https://github.com/egresada-qa",
+    )
+    project = new_project(student_email="egresada.qa@unmsm.edu.pe")
+    submit(project["id"], tech_stack=["Python", "FastAPI"])
+    sc.mark_project_opened(project["id"])
+    clock.advance(60)
+    validated = sc.register_teacher_decision(
+        project["id"], teacher_email=TEACHER, decision="Validado", validated_technologies=["Python", "PostgreSQL"]
+    )
+
+    portfolio = sc.get_public_portfolio_projects(graduate["id"])
+
+    assert portfolio == {
+        "student": {
+            "id": graduate["id"],
+            "full_name": "Egresada QA",
+            "school": "Ingeniería de Software",
+            "current_cycle": 9,
+            "linkedin_url": "https://www.linkedin.com/in/egresada-qa",
+            "github_url": "https://github.com/egresada-qa",
+        },
+        "projects": [
+            {
+                "project_id": project["id"],
+                "title": "Portafolio académico SkillFISI",
+                "course_name": "Gestión de Proyectos de TI",
+                "professional_summary": SUMMARY,
+                "validated_technologies": ["Python", "PostgreSQL"],
+                "verification_code": validated["verification_code"],
+                "decision_at": clock.now.isoformat(),
+                "teacher_full_name": "Docente QA",
+            }
+        ],
+    }
+    assert "@" not in repr(portfolio)
+
+
+def test_public_portfolio_accepts_id_or_email_and_orders_by_validation(people, clock):
+    older = validated_project(clock, title="Proyecto validado primero")
+    newer = validated_project(clock, title="Proyecto validado después")
+    student_id = sc._local_backend.find_user_by_email(STUDENT)["id"]
+
+    by_email = sc.get_public_portfolio_projects("  ALUMNO.QA@unmsm.edu.pe ")
+    by_id = sc.get_public_portfolio_projects(student_id.upper())
+
+    assert by_email == by_id
+    assert [project["project_id"] for project in by_id["projects"]] == [newer["id"], older["id"]]
+
+
+def test_public_portfolio_not_found_is_the_same_for_every_case(people, clock):
+    validated_project(clock)
+    new_project(student_email=OTHER_STUDENT)
+    teacher_id = sc._local_backend.find_user_by_email(TEACHER)["id"]
+
+    for identifier in (str(uuid.uuid4()), "sin.cuenta@unmsm.edu.pe", TEACHER, teacher_id, OTHER_STUDENT):
+        with pytest.raises(sc.PortfolioNotFoundError) as error:
+            sc.get_public_portfolio_projects(identifier)
+        assert (error.value.http_status, str(error.value)) == (404, sc.PORTFOLIO_NOT_FOUND_DETAIL)
+    assert issubclass(sc.PortfolioNotFoundError, sc.ProjectNotFoundError)
+
+
+@pytest.mark.parametrize("identifier", ["", "   ", None, "alumno@gmail.com", "no-es-un-id", "alumno.qa"])
+def test_public_portfolio_rejects_invalid_identifier(people, identifier):
+    with pytest.raises(sc.ProjectValidationError):
+        sc.get_public_portfolio_projects(identifier)
+
+
+# ---------------------------------------------------------------------------
+# Sprint 3 - el modo local aplica las restricciones de la 04
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("changes", "constraint"),
+    [
+        (lambda p: {"consent_law_29733": False}, "projects_consent_check"),
+        (
+            lambda p: {"consent_law_29733": False, "consent_revoked_at": p["consent_at"] - timedelta(seconds=1)},
+            "projects_consent_check",
+        ),
+        (
+            lambda p: {"consent_law_29733": False, "consent_at": None, "consent_revoked_at": p["decision_at"]},
+            "projects_consent_revoked_check",
+        ),
+        (lambda p: {"verification_code": None}, "projects_verification_code_status_check"),
+        (lambda p: {"verification_code": "FISI-2026-ABC2345"}, "projects_verification_code_check"),
+    ],
+)
+def test_local_store_enforces_sprint3_constraints_on_validated_project(people, clock, changes, constraint):
+    validated = validated_project(clock)
+    before = dict(sc._local_backend.projects[validated["id"]])
+
+    with pytest.raises(sc.DatabaseError) as error:
+        sc._local_backend.update_project(validated["id"], changes(before))
+
+    assert (error.value.code, error.value.constraint) == ("23514", constraint)
+    assert sc._local_backend.projects[validated["id"]] == before
+
+
+def test_local_store_enforces_unique_verification_code(people, clock):
+    first = validated_project(clock)
+    second = validated_project(clock, student_email=OTHER_STUDENT)
+
+    with pytest.raises(sc.DatabaseError) as error:
+        sc._local_backend.update_project(second["id"], {"verification_code": first["verification_code"]})
+
+    assert (error.value.code, error.value.constraint) == ("23505", "projects_verification_code_key")
+
+
+def test_local_portfolio_rows_match_public_view_of_migration_04(people, clock):
+    view = re.search(
+        r"CREATE VIEW public\.public_verified_portfolios(.*?);", MIGRATION_04.read_text(encoding="utf-8"), re.S
+    ).group(1)
+    select_list, conditions = view.split("\nFROM public.projects p")
+    validated = validated_project(clock)
+    student_id = sc._local_backend.find_user_by_email(STUDENT)["id"]
+
+    rows = sc._local_backend.fetch_public_portfolio(student_id)
+
+    assert re.findall(r"\bAS ([a-z_]+)\b", select_list) == list(sc.PUBLIC_PORTFOLIO_COLUMNS)
+    assert [list(row) for row in rows] == [list(sc.PUBLIC_PORTFOLIO_COLUMNS)]
+    assert rows[0]["project_id"] == validated["id"]
+    assert "email" not in view
+    assert "WHERE p.status = 'Validado'" in conditions and "AND p.consent_law_29733" in conditions
+
+
+def test_supabase_portfolio_query_reads_only_the_public_view(monkeypatch):
+    calls = []
+
+    class FakeQuery:
+        def __getattr__(self, name):
+            def method(*args, **kwargs):
+                calls.append((name, args, kwargs))
+                return self
+
+            return method
+
+        def execute(self):
+            return type("Result", (), {"data": []})()
+
+    class FakeClient:
+        def table(self, name):
+            calls.append(("table", (name,), {}))
+            return FakeQuery()
+
+    monkeypatch.setattr(sc, "get_admin_client", lambda: FakeClient())
+
+    assert sc._SupabaseBackend().fetch_public_portfolio("id-del-estudiante") == []
+    assert calls == [
+        ("table", ("public_verified_portfolios",), {}),
+        ("select", (",".join(sc.PUBLIC_PORTFOLIO_COLUMNS),), {}),
+        ("eq", ("student_id", "id-del-estudiante"), {}),
+        ("order", ("decision_at",), {"desc": True}),
+        ("order", ("project_id",), {}),
+    ]
