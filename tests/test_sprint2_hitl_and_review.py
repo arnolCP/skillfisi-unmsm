@@ -62,12 +62,14 @@ def submit_review(client, project_id, consent=True):
     })
 
 
-def test_rejects_submission_without_consent(client):
+def test_rejects_submission_without_consent(client, monkeypatch):
     project_id = create_draft(client)
     response = submit_review(client, project_id, consent=False)
 
     assert response.status_code == 400
     assert "29733" in response.json()["detail"]
+    student = auth_profiles.CurrentUser(id="estudiante-qa", email=STUDENT)
+    monkeypatch.setitem(app.dependency_overrides, auth_profiles.get_current_user, lambda: student)
     saved = client.get(f"/api/v1/projects/{project_id}").json()
     assert saved["status"] == "Borrador"
     assert saved["submitted_at"] is None

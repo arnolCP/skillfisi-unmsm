@@ -1,9 +1,11 @@
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, EmailStr, Field, field_validator
-from typing import List, Dict, Any
+from fastapi import APIRouter, Depends, HTTPException, Response
+from pydantic import BaseModel, EmailStr, Field, StrictBool
+from typing import Annotated, List, Dict, Any
 from datetime import datetime, timezone
 
+from routers.auth_profiles import CurrentUser, get_current_user
 from routers.projects import PROJECTS_DB
+from services.portfolio_privacy import PUBLIC_PORTFOLIO_HEADERS, is_public_project
 
 router = APIRouter(
     prefix="/api/v1/portfolio",
@@ -17,26 +19,18 @@ def _generate_seal_code(project_id: str) -> str:
 
 
 class PortfolioPrivacyUpdateRequest(BaseModel):
-    student_email: EmailStr
-    consent_law_29733: bool = Field(
+    student_email: EmailStr | None = None
+    consent_law_29733: StrictBool = Field(
         ...,
         description="True para autorizar publicación en portafolio público; False para revocar y ocultar de inmediato (Ley N.° 29733).",
     )
-
-    @field_validator("student_email")
-    @classmethod
-    def check_unmsm_domain(cls, v: str) -> str:
-        clean = v.strip().lower()
-        if not clean.endswith("@unmsm.edu.pe"):
-            raise ValueError("El correo debe pertenecer al dominio institucional @unmsm.edu.pe")
-        return clean
-
 
 @router.get(
     "/{student_identifier}",
     summary="HU11: Consultar portafolio público verificado de un estudiante (Reclutadores / CV / LinkedIn)",
 )
-def get_public_student_portfolio(student_identifier: str):
+def get_public_student_portfolio(student_identifier: str, response: Response):
+    response.headers.update(PUBLIC_PORTFOLIO_HEADERS)
     clean_id = student_identifier.strip().lower()
     if "@" not in clean_id:
         target_email = f"{clean_id}@unmsm.edu.pe"
@@ -57,12 +51,8 @@ def get_public_student_portfolio(student_identifier: str):
         if proj.get("student_email", "").lower() != target_email:
             continue
 
-        is_validated = proj.get("status") == "Validado"
-        has_consent = bool(proj.get("consent_law_29733")) is True
-
-        if is_validated and has_consent:
+        if is_public_project(proj):
             seal_code = proj.get("verification_code") or _generate_seal_code(proj["id"])
-            proj["verification_code"] = seal_code
 
             for tech in proj.get("tech_stack", []):
                 if tech and str(tech).strip():
@@ -83,7 +73,6 @@ def get_public_student_portfolio(student_identifier: str):
                         "verification_code": seal_code,
                         "validated_by_teacher": proj.get("teacher_email"),
                         "validated_at": proj.get("decision_at"),
-                        "teacher_feedback": proj.get("teacher_feedback"),
                     },
                 }
             )
@@ -106,7 +95,9 @@ def get_public_student_portfolio(student_identifier: str):
     summary="HU11 / R06: Activar o revocar consentimiento Ley N.° 29733 para ocultar/mostrar proyecto en portafolio público",
 )
 def update_project_privacy_consent(
-    project_id: str, payload: PortfolioPrivacyUpdateRequest
+    project_id: str,
+    payload: PortfolioPrivacyUpdateRequest,
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
 ):
     if project_id not in PROJECTS_DB:
         raise HTTPException(status_code=404, detail="Proyecto no encontrado.")
@@ -114,7 +105,9 @@ def update_project_privacy_consent(
     project = PROJECTS_DB[project_id]
     owner_email = project.get("student_email", "").lower()
 
-    if owner_email and owner_email != payload.student_email:
+    if owner_email != current_user.email.casefold() or (
+        payload.student_email is not None and owner_email != payload.student_email.casefold()
+    ):
         raise HTTPException(
             status_code=403,
             detail="Solo el estudiante titular del proyecto puede modificar su consentimiento de privacidad (Ley N.° 29733).",
@@ -124,9 +117,7 @@ def update_project_privacy_consent(
     project["consent_law_29733"] = payload.consent_law_29733
     project["consent_timestamp"] = now_iso
 
-    is_publicly_visible = (
-        project.get("status") == "Validado" and bool(project["consent_law_29733"]) is True
-    )
+    is_publicly_visible = is_public_project(project)
 
     action_text = (
         "Consentimiento Ley N.° 29733 activado."
@@ -147,16 +138,13 @@ def update_project_privacy_consent(
     "/verify/{verification_code}",
     summary="HU10 / HU11: Verificar autenticidad de un código de sello docente (FISI-2026-XXXXXX)",
 )
-def verify_official_teacher_seal(verification_code: str):
+def verify_official_teacher_seal(verification_code: str, response: Response):
+    response.headers.update(PUBLIC_PORTFOLIO_HEADERS)
     clean_code = verification_code.strip().upper()
 
     for proj in PROJECTS_DB.values():
         proj_code = (proj.get("verification_code") or _generate_seal_code(proj["id"])).upper()
-        if (
-            proj_code == clean_code
-            and proj.get("status") == "Validado"
-            and bool(proj.get("consent_law_29733")) is True
-        ):
+        if proj_code == clean_code and is_public_project(proj):
             return {
                 "valid_seal": True,
                 "verification_code": proj_code,
@@ -172,4 +160,5 @@ def verify_official_teacher_seal(verification_code: str):
     raise HTTPException(
         status_code=404,
         detail="Código de verificación no encontrado o el proyecto no cuenta con publicación pública autorizada.",
+        headers=PUBLIC_PORTFOLIO_HEADERS,
     )
