@@ -171,7 +171,9 @@ SELECT
     s.github_url AS student_github_url,
     p.id AS project_id,
     p.title AS project_title,
+    p.github_url AS project_github_url,
     c.name AS course_name,
+    c.cycle AS course_cycle,
     p.professional_summary AS professional_summary,
     ARRAY(
         SELECT pt.technology_name::text

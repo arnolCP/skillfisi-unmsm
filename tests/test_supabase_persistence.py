@@ -841,6 +841,7 @@ def test_public_portfolio_returns_only_public_data_without_emails(people, clock)
         github_url="https://github.com/egresada-qa",
     )
     project = new_project(student_email="egresada.qa@unmsm.edu.pe")
+    sc.save_project_evidence(project["id"], github_url="https://github.com/egresada-qa/portafolio.git")
     submit(project["id"], tech_stack=["Python", "FastAPI"])
     sc.mark_project_opened(project["id"])
     clock.advance(60)
@@ -863,7 +864,9 @@ def test_public_portfolio_returns_only_public_data_without_emails(people, clock)
             {
                 "project_id": project["id"],
                 "title": "Portafolio académico SkillFISI",
+                "github_url": "https://github.com/egresada-qa/portafolio",
                 "course_name": "Gestión de Proyectos de TI",
+                "course_cycle": 8,
                 "professional_summary": SUMMARY,
                 "validated_technologies": ["Python", "PostgreSQL"],
                 "verification_code": validated["verification_code"],
