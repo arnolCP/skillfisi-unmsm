@@ -11,6 +11,7 @@
 --   2. Revocación del consentimiento de la Ley N.° 29733 en proyectos 'Validado' (HU11, riesgo R06).
 --   3. Índice idx_projects_public_portfolio para la consulta del portafolio público.
 --   4. Vista public_verified_portfolios: solo datos públicos, solo para el backend.
+--   5. Índices de la versión reducida de la 02 (PR #8) que la 02 restaurada no incluye.
 -- =============================================================================
 
 BEGIN;
@@ -196,13 +197,47 @@ COMMENT ON VIEW public.public_verified_portfolios IS
 REVOKE ALL ON public.public_verified_portfolios FROM PUBLIC, anon, authenticated, service_role;
 GRANT SELECT ON public.public_verified_portfolios TO service_role;
 
+-- -----------------------------------------------------------------------------
+-- 5. Lo que aportaba la versión reducida de la 02 (PR #8)
+--    La 02 del repositorio volvió a ser la aplicada en skillfisi-dev. De la versión del
+--    PR #8 se conservan sus dos índices, que la 02 no tiene.
+--    No se copian: la clave foránea fk_users_auth_id ni el UNIQUE unique_student_code,
+--    porque la 02 ya los crea como users_id_fkey y users_student_code_key; tampoco el valor
+--    por defecto 0 de active_review_seconds, que contradice projects_review_seconds_check
+--    (sin decisión, el tiempo de revisión debe ser nulo).
+-- -----------------------------------------------------------------------------
+
+-- 5.1 Búsqueda por huella de la evidencia (caché del motor LLM).
+CREATE INDEX IF NOT EXISTS idx_projects_evidence_hash
+    ON public.projects (evidence_hash);
+
+-- 5.2 Bandeja del docente: proyectos 'En Revisión' de sus cursos.
+CREATE INDEX IF NOT EXISTS idx_projects_teacher_review
+    ON public.projects (course_id, status)
+    WHERE status = 'En Revisión';
+
+-- 5.3 Si en alguna base se ejecutó la versión del PR #8, se quitan sus restricciones
+--     duplicadas y el valor por defecto 0. En skillfisi-dev no cambia nada.
+ALTER TABLE public.projects ALTER COLUMN active_review_seconds DROP DEFAULT;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'public.users'::regclass AND conname = 'users_id_fkey') THEN
+        ALTER TABLE public.users DROP CONSTRAINT IF EXISTS fk_users_auth_id;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'public.users'::regclass AND conname = 'users_student_code_key') THEN
+        ALTER TABLE public.users DROP CONSTRAINT IF EXISTS unique_student_code;
+    END IF;
+END
+$$;
+
 COMMIT;
 
 -- -----------------------------------------------------------------------------
--- Verificación (solo lectura). Resultado esperado (10 filas):
+-- Verificación (solo lectura). Resultado esperado (12 filas):
 --   1. Columnas verification_code (character varying(32)) y consent_revoked_at.
 --   2. Las 6 restricciones de esta migración en projects.
---   3. El índice idx_projects_public_portfolio con su condición WHERE.
+--   3. Los índices idx_projects_evidence_hash, idx_projects_public_portfolio e
+--      idx_projects_teacher_review, los dos últimos con su condición WHERE.
 --   4. La vista con security_invoker=true y los privilegios: solo service_role con SELECT.
 -- -----------------------------------------------------------------------------
 SELECT '1. Columna' AS seccion, column_name::text AS objeto,
@@ -223,7 +258,8 @@ WHERE conrelid = 'public.projects'::regclass
 UNION ALL
 SELECT '3. Índice', indexname::text, indexdef
 FROM pg_indexes
-WHERE schemaname = 'public' AND indexname = 'idx_projects_public_portfolio'
+WHERE schemaname = 'public'
+  AND indexname IN ('idx_projects_evidence_hash', 'idx_projects_public_portfolio', 'idx_projects_teacher_review')
 UNION ALL
 SELECT '4. Vista', c.relname::text,
        format('opciones=%s | privilegios=%s',
