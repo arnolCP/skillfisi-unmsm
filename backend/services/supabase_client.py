@@ -1,4 +1,4 @@
-"""Conexión con Supabase y persistencia de proyectos del backend (Módulos 3.1 a 3.4).
+"""Conexión con Supabase y persistencia de proyectos del backend (Módulos 3.1 a 3.5).
 
 Se usan dos tipos de cliente:
 - Administrador (clave service_role): solo vive en el backend y omite RLS,
@@ -6,11 +6,14 @@ Se usan dos tipos de cliente:
 - Autenticación (clave anon): se crea uno nuevo por cada inicio de sesión
   para que las sesiones de distintos usuarios nunca se mezclen.
 
-Persistencia de proyectos (HU03, HU04, HU06 y HU07):
+Persistencia de proyectos (HU03, HU04, HU06, HU07, HU10 y HU11):
 - Las funciones públicas reciben los datos tal como los usan routers/projects.py y
   routers/teacher_reviews.py (correos, course_name, cycle) y devuelven un diccionario
-  plano con las mismas claves que PROJECTS_DB.
-- Modo "supabase": tablas de database/01_schema.sql y 02_sprint2_migration.sql.
+  plano con las claves de PROJECTS_DB más verification_code y consent_revoked_at.
+- El portafolio público (get_public_portfolio_projects) se lee de la vista
+  public_verified_portfolios y nunca devuelve correos.
+- Modo "supabase": tablas de database/01_schema.sql, 02_sprint2_migration.sql y
+  04_sprint3_portfolio.sql.
 - Modo "local": memoria del proceso (pruebas y CI), con las mismas restricciones que la base.
   El modo se decide una sola vez (ver resolve_persistence_mode) y nunca cambia por un
   error de red: si Supabase falla se lanza DatabaseError.
@@ -20,6 +23,8 @@ Errores que lanzan las funciones y código HTTP que debe devolver el router
 - ProjectValidationError (también es ValueError) -> 400: dato de entrada inválido.
 - NotAuthorizedError -> 403: el correo no es del estudiante dueño ni del docente del curso.
 - ProjectNotFoundError -> 404: el proyecto no existe.
+- PortfolioNotFoundError -> 404: no hay portafolio público para ese estudiante
+  (subclase de ProjectNotFoundError).
 - InvalidTransitionError -> 409: el estado actual no permite la operación.
 - ReferenceNotFoundError -> 422: el estudiante o el docente no tiene cuenta en SkillFISI.
 - DatabaseError -> 503: Supabase no respondió o rechazó la operación.
@@ -37,6 +42,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import threading
 import uuid
 from collections.abc import Iterable, Mapping
@@ -136,6 +142,35 @@ USERS_TABLE = "users"
 COURSES_TABLE = "courses"
 PROJECTS_TABLE = "projects"
 TECHNOLOGIES_TABLE = "project_technologies"
+PUBLIC_PORTFOLIO_VIEW = "public_verified_portfolios"
+
+# HU10: código del sello "Validado por Docente" (formato FISI-2026-XXXXXX, columna verification_code).
+# Se omiten 0, O, 1 e I para que no se confundan al dictar o copiar el código.
+VERIFICATION_CODE_PREFIX = "FISI-2026-"
+VERIFICATION_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+VERIFICATION_CODE_LENGTH = 6
+MAX_VERIFICATION_CODE_ATTEMPTS = 5
+
+# HU11: columnas de la vista public_verified_portfolios (database/04_sprint3_portfolio.sql).
+# Solo datos públicos: ningún correo, código de matrícula, comentario del docente ni telemetría.
+PUBLIC_PORTFOLIO_COLUMNS = (
+    "student_id",
+    "student_full_name",
+    "student_school",
+    "student_current_cycle",
+    "student_linkedin_url",
+    "student_github_url",
+    "project_id",
+    "project_title",
+    "project_github_url",
+    "course_name",
+    "course_cycle",
+    "professional_summary",
+    "validated_technologies",
+    "verification_code",
+    "decision_at",
+    "teacher_full_name",
+)
 
 # Proyecto con su estudiante, su curso (con el docente) y sus tecnologías en una sola consulta.
 # Los nombres de las claves foráneas evitan la ambigüedad users <-> courses a través de projects.
@@ -169,6 +204,11 @@ OPEN_STATE_DETAIL = (
 DECISION_STATE_DETAIL = (
     "Solo se pueden evaluar proyectos en estado 'En Revisión' (estado actual: {status})."
 )
+PRIVACY_STATE_DETAIL = (
+    "Solo se puede activar o revocar la publicación de un proyecto 'Validado' (estado actual: {status})."
+)
+PORTFOLIO_NOT_FOUND_DETAIL = "Portafolio no encontrado o sin proyectos publicados."
+VERIFICATION_CODE_DETAIL = "No se pudo generar un código de verificación único. Intenta nuevamente."
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +238,17 @@ class ProjectNotFoundError(ProjectRepositoryError):
     http_status = 404
 
     def __init__(self, message: str = "Proyecto no encontrado."):
+        super().__init__(message)
+
+
+class PortfolioNotFoundError(ProjectNotFoundError):
+    """No hay portafolio público para ese estudiante -> 404.
+
+    Es la misma respuesta si el estudiante no existe o si no tiene proyectos publicados,
+    para no revelar qué correos o ids tienen cuenta.
+    """
+
+    def __init__(self, message: str = PORTFOLIO_NOT_FOUND_DETAIL):
         super().__init__(message)
 
 
@@ -345,6 +396,15 @@ def compute_evidence_hash(evidence_text: str) -> str:
     return hashlib.sha256(evidence_text.strip().encode("utf-8")).hexdigest()
 
 
+def generate_verification_code() -> str:
+    """HU10: código del sello docente, por ejemplo FISI-2026-7KQ2XM (generador criptográfico).
+
+    No garantiza unicidad por sí solo: register_teacher_decision reintenta si el código ya existe.
+    """
+    suffix = "".join(secrets.choice(VERIFICATION_CODE_ALPHABET) for _ in range(VERIFICATION_CODE_LENGTH))
+    return VERIFICATION_CODE_PREFIX + suffix
+
+
 def _normalize_email(email: str, owner_label: str) -> str:
     if not isinstance(email, str) or not is_institutional_email(email):
         raise ProjectValidationError(
@@ -415,23 +475,43 @@ def _serialize(row: Mapping) -> dict:
 
 # ---------------------------------------------------------------------------
 # Restricciones de la base replicadas en el modo local
-# (deben coincidir con 01_schema.sql y 02_sprint2_migration.sql)
+# (deben coincidir con 01_schema.sql, 02_sprint2_migration.sql y 04_sprint3_portfolio.sql)
 # ---------------------------------------------------------------------------
 _GITHUB_URL_DB_PATTERN = re.compile(r"^https://(www\.)?github\.com/[^/?#]+/[^/?#]+")
 _EVIDENCE_HASH_DB_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_VERIFICATION_CODE_DB_PATTERN = re.compile(r"FISI-2026-[A-Z0-9]{6}")  # se usa con fullmatch
 
 
 def _is_after_or_equal(later: datetime | None, earlier: datetime | None) -> bool:
     return later is not None and earlier is not None and later >= earlier
 
 
+def _consent_is_coherent(p: dict) -> bool:
+    """projects_consent_check de la 04: activo, nunca otorgado, o revocado (solo en 'Validado')."""
+    if p["consent_law_29733"]:
+        return p["consent_at"] is not None and (
+            p["consent_revoked_at"] is None or p["consent_revoked_at"] <= p["consent_at"]
+        )
+    if p["consent_at"] is None:
+        return True
+    return p["status"] == STATUS_VALIDATED and _is_after_or_equal(p["consent_revoked_at"], p["consent_at"])
+
+
 _PROJECT_CHECKS = (
     ("projects_status_check", lambda p: p["status"] in PROJECT_STATUSES),
-    ("projects_consent_check", lambda p: p["consent_law_29733"] == (p["consent_at"] is not None)),
+    ("projects_consent_check", _consent_is_coherent),
     (
         "projects_submission_check",
         lambda p: p["status"] == STATUS_DRAFT
-        or (p["consent_law_29733"] and p["submitted_at"] is not None and p["professional_summary"] is not None),
+        or (
+            (p["consent_law_29733"] or p["consent_revoked_at"] is not None)
+            and p["submitted_at"] is not None
+            and p["professional_summary"] is not None
+        ),
+    ),
+    (
+        "projects_consent_revoked_check",
+        lambda p: p["consent_revoked_at"] is None or (p["status"] == STATUS_VALIDATED and p["consent_at"] is not None),
     ),
     (
         "projects_opened_check",
@@ -462,6 +542,18 @@ _PROJECT_CHECKS = (
     (
         "projects_github_url_check",
         lambda p: p["github_url"] is None or bool(_GITHUB_URL_DB_PATTERN.match(p["github_url"])),
+    ),
+    (
+        "projects_verification_code_check",
+        lambda p: p["verification_code"] is None
+        or (
+            isinstance(p["verification_code"], str)
+            and bool(_VERIFICATION_CODE_DB_PATTERN.fullmatch(p["verification_code"]))
+        ),
+    ),
+    (
+        "projects_verification_code_status_check",
+        lambda p: (p["status"] == STATUS_VALIDATED) == (p["verification_code"] is not None),
     ),
 )
 
@@ -574,6 +666,18 @@ class _SupabaseBackend:
                 lambda c: c.table(TECHNOLOGIES_TABLE).insert([_serialize(row) for row in rows]),
             )
 
+    def fetch_public_portfolio(self, student_id: str) -> list[dict]:
+        """Filas de la vista public_verified_portfolios del estudiante, de la validación más reciente a la más antigua."""
+        result = self._execute(
+            "consultar portafolio público",
+            lambda c: c.table(PUBLIC_PORTFOLIO_VIEW)
+            .select(",".join(PUBLIC_PORTFOLIO_COLUMNS))
+            .eq("student_id", student_id)
+            .order("decision_at", desc=True)
+            .order("project_id"),
+        )
+        return result.data or []
+
 
 class _LocalBackend:
     """Tablas en memoria con las mismas restricciones que la base (claves, UNIQUE y CHECK)."""
@@ -596,16 +700,25 @@ class _LocalBackend:
 
     def add_user(self, row: dict) -> dict:
         with self._lock:
-            if row["id"] in self.users:
+            user = {
+                "school": "Ingeniería de Sistemas",
+                "current_cycle": None,
+                "linkedin_url": None,
+                "github_url": None,
+                **row,
+            }
+            if user["id"] in self.users:
                 raise DatabaseError(code="23505", constraint="users_pkey")
-            if any(user["email"] == row["email"] for user in self.users.values()):
+            if any(existing["email"] == user["email"] for existing in self.users.values()):
                 raise DatabaseError(code="23505", constraint="users_email_key")
-            if row["role"] not in USER_ROLES:
+            if user["role"] not in USER_ROLES:
                 raise DatabaseError(code="23514", constraint="users_role_check")
-            if not row["email"].endswith("@unmsm.edu.pe"):
+            if not user["email"].endswith("@unmsm.edu.pe"):
                 raise DatabaseError(code="23514", constraint="check_institutional_email")
-            self.users[row["id"]] = dict(row)
-            return dict(row)
+            if user["current_cycle"] is not None and not 1 <= user["current_cycle"] <= 10:
+                raise DatabaseError(code="23514", constraint="users_current_cycle_check")
+            self.users[user["id"]] = user
+            return dict(user)
 
     def find_user_by_email(self, email: str) -> dict | None:
         with self._lock:
@@ -651,6 +764,8 @@ class _LocalBackend:
                 "professional_summary": None,
                 "github_url": None,
                 "consent_at": None,
+                "verification_code": None,
+                "consent_revoked_at": None,
                 **row,
             }
             if project["student_id"] not in self.users:
@@ -658,8 +773,16 @@ class _LocalBackend:
             if project["course_id"] not in self.courses:
                 raise DatabaseError(code="23503", constraint="projects_course_id_fkey")
             _check_local_project(project)
+            self._check_unique_verification_code(project)
             self.projects[project["id"]] = project
             return dict(project)
+
+    def _check_unique_verification_code(self, row: dict) -> None:
+        code = row["verification_code"]
+        if code is not None and any(
+            other["id"] != row["id"] and other["verification_code"] == code for other in self.projects.values()
+        ):
+            raise DatabaseError(code="23505", constraint="projects_verification_code_key")
 
     def _joined(self, project: dict) -> dict:
         course = self.courses[project["course_id"]]
@@ -717,6 +840,7 @@ class _LocalBackend:
                 return None
             candidate = {**current, **changes}
             _check_local_project(candidate)
+            self._check_unique_verification_code(candidate)
             self.projects[project_id] = candidate
             return dict(candidate)
 
@@ -728,6 +852,50 @@ class _LocalBackend:
                 raise DatabaseError(code="22001", constraint="project_technologies_technology_name")
             self.technologies = [tech for tech in self.technologies if tech["project_id"] != project_id]
             self.technologies.extend({"id": str(uuid.uuid4()), **row} for row in rows)
+
+    def fetch_public_portfolio(self, student_id: str) -> list[dict]:
+        """Mismas filas y filtros que la vista public_verified_portfolios de la 04."""
+        with self._lock:
+            student = self.users.get(student_id)
+            if student is None or student["role"] != "Estudiante":
+                return []
+            rows = []
+            for project in self.projects.values():
+                if (
+                    project["student_id"] != student_id
+                    or project["status"] != STATUS_VALIDATED
+                    or not project["consent_law_29733"]
+                ):
+                    continue
+                course = self.courses[project["course_id"]]
+                teacher = self.users.get(course["teacher_id"]) if course["teacher_id"] else None
+                validated = sorted(
+                    (tech for tech in self.technologies if tech["project_id"] == project["id"] and tech["validated_by_teacher"]),
+                    key=lambda tech: (tech["created_at"], tech["technology_name"]),
+                )
+                rows.append(
+                    {
+                        "student_id": student["id"],
+                        "student_full_name": student["full_name"],
+                        "student_school": student["school"],
+                        "student_current_cycle": student["current_cycle"],
+                        "student_linkedin_url": student["linkedin_url"],
+                        "student_github_url": student["github_url"],
+                        "project_id": project["id"],
+                        "project_title": project["title"],
+                        "project_github_url": project["github_url"],
+                        "course_name": course["name"],
+                        "course_cycle": course["cycle"],
+                        "professional_summary": project["professional_summary"],
+                        "validated_technologies": [tech["technology_name"] for tech in validated],
+                        "verification_code": project["verification_code"],
+                        "decision_at": project["decision_at"],
+                        "teacher_full_name": teacher["full_name"] if teacher else None,
+                    }
+                )
+            rows.sort(key=lambda row: row["project_id"])
+            rows.sort(key=lambda row: row["decision_at"], reverse=True)
+            return rows
 
 
 _supabase_backend = _SupabaseBackend()
@@ -754,7 +922,8 @@ def _teacher_email(row: dict) -> str | None:
 
 
 def _to_record(row: dict) -> dict:
-    """Misma forma que PROJECTS_DB en routers/projects.py.
+    """Misma forma que PROJECTS_DB en routers/projects.py, más verification_code (HU10)
+    y consent_revoked_at (HU11).
 
     extracted_evidence_text y evidence_char_count no se guardan (minimización de datos,
     Ley N.° 29733): se devuelven vacíos; el texto solo vive en la respuesta de la carga.
@@ -782,6 +951,8 @@ def _to_record(row: dict) -> dict:
         "active_review_seconds": row.get("active_review_seconds"),
         "teacher_feedback": row.get("teacher_feedback"),
         "created_at": _iso(row.get("created_at")),
+        "verification_code": row.get("verification_code"),
+        "consent_revoked_at": _iso(row.get("consent_revoked_at")),
     }
 
 
@@ -852,6 +1023,24 @@ def _get_or_create_course(backend, teacher_id: str, name: str, cycle: int) -> di
             if exc.code != "23505":
                 raise
     raise DatabaseError()
+
+
+def _update_with_new_verification_code(backend, project_id: str, changes: dict, **conditions) -> dict | None:
+    """UPDATE condicional que además asigna un verification_code nuevo.
+
+    Si el código ya lo tiene otro proyecto (UNIQUE projects_verification_code_key, SQLSTATE 23505),
+    genera otro y reintenta hasta MAX_VERIFICATION_CODE_ATTEMPTS veces.
+    """
+    for _ in range(MAX_VERIFICATION_CODE_ATTEMPTS):
+        try:
+            return backend.update_project(
+                project_id, {**changes, "verification_code": generate_verification_code()}, **conditions
+            )
+        except DatabaseError as exc:
+            if exc.code != "23505":
+                raise
+            logger.warning("Código de verificación repetido; se genera otro.")
+    raise DatabaseError(VERIFICATION_CODE_DETAIL, code="23505", constraint="projects_verification_code_key")
 
 
 # ---------------------------------------------------------------------------
@@ -1026,6 +1215,8 @@ def register_teacher_decision(
     Si llegan validated_technologies, reemplazan el stack; las tecnologías quedan marcadas como
     validadas solo si la decisión es 'Validado'. El UPDATE es condicional al estado
     'En Revisión', así que una segunda decisión sobre el mismo proyecto falla con 409.
+    HU10: 'Validado' genera el verification_code único (FISI-2026-XXXXXX) del sello docente;
+    si el código ya existe se genera otro. 'Observado' no tiene código.
     Errores: ProjectValidationError (400), NotAuthorizedError (403), ProjectNotFoundError (404),
     InvalidTransitionError (409), DatabaseError (503).
     """
@@ -1063,17 +1254,17 @@ def register_teacher_decision(
         names = new_stack or [tech["technology_name"] for tech in _sorted_technologies(current)]
         tech_rows = _technology_rows(pid, names, validated=decision == STATUS_VALIDATED, now=decided_at)
         backend.replace_technologies(pid, tech_rows)
-        updated = backend.update_project(
-            pid,
-            {
-                "status": decision,
-                "decision_at": decided_at,
-                "active_review_seconds": review_seconds,
-                "teacher_feedback": feedback,
-            },
-            statuses=(STATUS_IN_REVIEW,),
-            opened_is_null=False,
-        )
+        changes = {
+            "status": decision,
+            "decision_at": decided_at,
+            "active_review_seconds": review_seconds,
+            "teacher_feedback": feedback,
+        }
+        conditions = {"statuses": (STATUS_IN_REVIEW,), "opened_is_null": False}
+        if decision == STATUS_VALIDATED:
+            updated = _update_with_new_verification_code(backend, pid, changes, **conditions)
+        else:
+            updated = backend.update_project(pid, changes, **conditions)
         if updated is None:
             _raise_conflict(backend, pid, (STATUS_IN_REVIEW,), DECISION_STATE_DETAIL)
     return _to_record({**current, **updated, "project_technologies": tech_rows})
@@ -1116,6 +1307,111 @@ def list_pending_reviews(teacher_email: str | None = None) -> list[dict]:
     return [_to_record(row) for row in rows]
 
 
+def update_project_privacy_consent(
+    project_id: str,
+    consent_law_29733: bool,
+    student_email: str | None = None,
+) -> dict:
+    """HU11 / riesgo R06: activa o revoca la publicación de un proyecto 'Validado' (Ley N.° 29733).
+
+    - Revocar (False): el proyecto sale de inmediato de la vista public_verified_portfolios.
+      Se guarda consent_revoked_at y se conservan el estado, el sello y la fecha del último consentimiento.
+    - Activar (True): consent_at toma la fecha actual; consent_revoked_at queda como la última revocación.
+    - Si el consentimiento ya tiene el valor pedido, devuelve el proyecto sin cambios.
+    Solo para proyectos 'Validado': en los demás estados el consentimiento se otorga al enviar a revisión.
+    Si se indica student_email, debe ser el dueño.
+    Errores: ProjectValidationError (400), NotAuthorizedError (403), ProjectNotFoundError (404),
+    InvalidTransitionError (409), DatabaseError (503).
+    """
+    pid = _parse_project_id(project_id)
+    if not isinstance(consent_law_29733, bool):
+        raise ProjectValidationError("consent_law_29733 debe ser true (activar) o false (revocar).")
+    owner = _normalize_email(student_email, "del estudiante") if student_email is not None else None
+
+    backend = _backend()
+    with backend.atomic():
+        current = _load_project(backend, pid)
+        if owner is not None and (current.get("student") or {}).get("email") != owner:
+            raise NotAuthorizedError("Solo el estudiante dueño puede cambiar la publicación de este proyecto.")
+        _require_status(current, (STATUS_VALIDATED,), PRIVACY_STATE_DETAIL)
+        if bool(current["consent_law_29733"]) == consent_law_29733:
+            return _to_record(current)
+
+        now = _utcnow()
+        if consent_law_29733:
+            changes = {"consent_law_29733": True, "consent_at": now}
+        else:
+            changes = {"consent_law_29733": False, "consent_revoked_at": now}
+        updated = backend.update_project(pid, changes, statuses=(STATUS_VALIDATED,))
+        if updated is None:
+            _raise_conflict(backend, pid, (STATUS_VALIDATED,), PRIVACY_STATE_DETAIL)
+    return _to_record({**current, **updated})
+
+
+def _resolve_portfolio_student_id(backend, identifier: str) -> str | None:
+    """Id del estudiante a partir de su id (UUID) o de su correo institucional (None si no existe)."""
+    if not isinstance(identifier, str) or not identifier.strip():
+        raise ProjectValidationError("Indica el id o el correo institucional del estudiante.")
+    candidate = identifier.strip()
+    try:
+        return str(uuid.UUID(candidate))
+    except ValueError:
+        pass
+    if not is_institutional_email(candidate):
+        raise ProjectValidationError(
+            "El portafolio se consulta con el id del estudiante o con su correo institucional @unmsm.edu.pe."
+        )
+    user = backend.find_user_by_email(candidate.casefold())
+    return user["id"] if user is not None and user["role"] == "Estudiante" else None
+
+
+def get_public_portfolio_projects(student_email: str) -> dict:
+    """HU11: portafolio profesional público de un estudiante (para reclutadores, sin sesión).
+
+    student_email acepta el correo institucional o el id (UUID) del estudiante; el id permite
+    compartir la URL sin exponer el correo. Solo incluye proyectos 'Validado' con consentimiento
+    activo de la Ley N.° 29733 (vista public_verified_portfolios) y no devuelve ningún correo.
+
+    Devuelve {"student": {...}, "projects": [...]}, con los proyectos de la validación más
+    reciente a la más antigua. Si el estudiante no existe o no tiene proyectos publicados lanza
+    PortfolioNotFoundError en ambos casos: no se revela qué cuentas existen ni se publican los
+    datos de quien no autorizó publicar nada.
+    Errores: ProjectValidationError (400), PortfolioNotFoundError (404), DatabaseError (503).
+    """
+    backend = _backend()
+    student_id = _resolve_portfolio_student_id(backend, student_email)
+    rows = backend.fetch_public_portfolio(student_id) if student_id is not None else []
+    if not rows:
+        raise PortfolioNotFoundError()
+
+    first = rows[0]
+    return {
+        "student": {
+            "id": str(first["student_id"]),
+            "full_name": first["student_full_name"],
+            "school": first["student_school"],
+            "current_cycle": first["student_current_cycle"],
+            "linkedin_url": first["student_linkedin_url"],
+            "github_url": first["student_github_url"],
+        },
+        "projects": [
+            {
+                "project_id": str(row["project_id"]),
+                "title": row["project_title"],
+                "github_url": row["project_github_url"],
+                "course_name": row["course_name"],
+                "course_cycle": row["course_cycle"],
+                "professional_summary": row["professional_summary"] or "",
+                "validated_technologies": list(row["validated_technologies"] or []),
+                "verification_code": row["verification_code"],
+                "decision_at": _iso(row["decision_at"]),
+                "teacher_full_name": row["teacher_full_name"],
+            }
+            for row in rows
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Solo para el modo local (pruebas)
 # ---------------------------------------------------------------------------
@@ -1124,7 +1420,16 @@ def _require_local_mode(function_name: str) -> None:
         raise RuntimeError(f"{function_name} solo está disponible en el modo de persistencia local.")
 
 
-def register_local_user(*, email: str, full_name: str, role: str = "Estudiante") -> dict:
+def register_local_user(
+    *,
+    email: str,
+    full_name: str,
+    role: str = "Estudiante",
+    school: str | None = "Ingeniería de Sistemas",
+    current_cycle: int | None = None,
+    linkedin_url: str | None = None,
+    github_url: str | None = None,
+) -> dict:
     """Crea un usuario en el almacenamiento local, como si existiera en auth.users y en users."""
     _require_local_mode("register_local_user")
     return _local_backend.add_user(
@@ -1133,6 +1438,10 @@ def register_local_user(*, email: str, full_name: str, role: str = "Estudiante")
             "email": _normalize_email(email, "del usuario"),
             "full_name": full_name,
             "role": role,
+            "school": school,
+            "current_cycle": current_cycle,
+            "linkedin_url": linkedin_url,
+            "github_url": github_url,
         }
     )
 
