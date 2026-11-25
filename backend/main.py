@@ -1,17 +1,18 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers import (
+    analytics_dashboard,
     auth_profiles,
     llm_extraction,
     projects,
-    teacher_reviews,
     public_portfolio,
+    teacher_reviews,
 )
 
 app = FastAPI(
     title="SkillFISI API - UNMSM",
-    description="API REST para Gestión de Portafolios Académicos, Extracción IA, Validación Docente y Portafolio Público (FISI - UNMSM)",
-    version="1.3.0",
+    description="API REST para Gestión de Portafolios Académicos, Extracción IA, Validación Docente, Portafolio Público y Panel Analítico Gerencial (FISI - UNMSM)",
+    version="2.2.0",
 )
 
 # Configuración CORS
@@ -42,6 +43,9 @@ app.include_router(teacher_reviews.router)
 # 5. Módulo 3.5 / HU11 - Portafolio Profesional Público y Ley N.° 29733 (Arnol)
 app.include_router(public_portfolio.router)
 
+# 6. Módulo 3.6 / HU12 y HU13 - Panel Analítico y Gerencial para Autoridades FISI (Arnol)
+app.include_router(analytics_dashboard.router)
+
 
 @app.get("/", tags=["Health Check"])
 def health_check():
@@ -53,4 +57,5 @@ def health_check():
         "module_3_3": "active",
         "module_3_4": "active",
         "module_3_5": "active",
+        "module_3_6": "active",
     }
