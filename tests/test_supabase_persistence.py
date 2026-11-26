@@ -1,15 +1,18 @@
 """Pruebas de la persistencia de proyectos (services/supabase_client.py) en modo local.
 
-El modo local aplica las mismas restricciones que database/02_sprint2_migration.sql y
-database/04_sprint3_portfolio.sql, así que estas pruebas validan las reglas del flujo
-sin conectarse a Supabase.
+El modo local aplica las mismas restricciones que database/02_sprint2_migration.sql,
+database/04_sprint3_portfolio.sql y database/05_sprint4_analytics_views.sql, y devuelve
+las mismas filas que sus vistas, así que estas pruebas validan las reglas del flujo y las
+métricas del panel de autoridades sin conectarse a Supabase.
 """
 
 import hashlib
 import re
 import uuid
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -651,7 +654,10 @@ def test_local_store_enforces_unique_and_foreign_keys(people):
         sc._local_backend.insert_project({"title": "Sin dueño", "course_id": course_id, "student_id": str(uuid.uuid4())})
 
     assert (duplicated_email.value.code, duplicated_email.value.constraint) == ("23505", "users_email_key")
-    assert (duplicated_course.value.code, duplicated_course.value.constraint) == ("23505", "courses_teacher_name_key")
+    assert (duplicated_course.value.code, duplicated_course.value.constraint) == (
+        "23505",
+        "courses_teacher_name_semester_key",
+    )
     assert (missing_student.value.code, missing_student.value.constraint) == ("23503", "projects_student_id_fkey")
 
 
@@ -994,3 +1000,393 @@ def test_supabase_portfolio_query_reads_only_the_public_view(monkeypatch):
         ("order", ("decision_at",), {"desc": True}),
         ("order", ("project_id",), {}),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Sprint 4 - HU13: semestre de los cursos
+# ---------------------------------------------------------------------------
+MIGRATION_05 = Path(__file__).resolve().parents[1] / "database" / "05_sprint4_analytics_views.sql"
+IS_COURSE = "Ingeniería de Software"
+IA_COURSE = "Inteligencia Artificial"
+
+
+def test_new_courses_store_the_current_semester(people, monkeypatch):
+    first = new_project()
+    monkeypatch.setattr(sc, "CURRENT_SEMESTER", "2027-1")
+    second = new_project(course_name="gestión de proyectos de ti", student_email=OTHER_STUDENT)
+    again = new_project(student_email=OTHER_STUDENT)
+
+    assert sorted(course["semester"] for course in sc._local_backend.courses.values()) == ["2026-2", "2027-1"]
+    assert (first["semester"], second["semester"], again["semester"]) == ("2026-2", "2027-1", "2027-1")
+    assert again["course_name"] == second["course_name"] == "gestión de proyectos de ti"
+    assert sc.get_project(first["id"])["semester"] == "2026-2"
+
+
+def test_local_courses_enforce_semester_constraints_of_migration_05(people):
+    teacher_id = sc._local_backend.find_user_by_email(TEACHER)["id"]
+    course = {"name": "Redes de Computadoras", "cycle": 6, "teacher_id": teacher_id}
+    sc._local_backend.insert_course({"code": "RED-1", **course})
+    sc._local_backend.insert_course({"code": "RED-2", **course, "semester": "2027-1"})
+
+    with pytest.raises(sc.DatabaseError) as duplicated:
+        sc._local_backend.insert_course({"code": "RED-3", **course, "name": "REDES DE COMPUTADORAS"})
+    with pytest.raises(sc.DatabaseError) as invalid:
+        sc._local_backend.insert_course({"code": "RED-4", **course, "semester": "2026-3"})
+
+    assert (duplicated.value.code, duplicated.value.constraint) == ("23505", "courses_teacher_name_semester_key")
+    assert (invalid.value.code, invalid.value.constraint) == ("23514", "courses_semester_check")
+
+
+def test_migration_05_semester_matches_backend():
+    sql = MIGRATION_05.read_text(encoding="utf-8")
+
+    assert "Falta aplicar database/04_sprint3_portfolio.sql" in sql
+    assert f"ALTER COLUMN semester SET DEFAULT '{sc.CURRENT_SEMESTER}'" in sql
+    assert f"CHECK (semester ~ '^{sc.SEMESTER_PATTERN.pattern}$')" in sql
+    assert "ON public.courses (teacher_id, lower(name), semester)" in sql
+    assert "DROP INDEX IF EXISTS public.courses_teacher_name_key;" in sql
+
+
+# ---------------------------------------------------------------------------
+# Sprint 4 - HU12 y HU13: vistas analíticas y panel de autoridades
+# ---------------------------------------------------------------------------
+def analytics_project(clock, course=IS_COURSE, cycle="8vo Ciclo", *, techs=None, decision=None, seconds=60,
+                      teacher=TEACHER, opened=True, revoke=False):
+    """Proyecto que llega hasta el estado pedido: Borrador (sin techs), En Revisión o la decisión."""
+    project = new_project(course_name=course, cycle=cycle, teacher_email=teacher)
+    if techs is None:
+        return project
+    clock.advance(10)
+    submit(project["id"], tech_stack=techs)
+    if not opened:
+        return project
+    clock.advance(10)
+    sc.mark_project_opened(project["id"])
+    if decision is None:
+        return project
+    clock.advance(seconds)
+    feedback = "Faltan pruebas de integración." if decision == "Observado" else None
+    project = sc.register_teacher_decision(
+        project["id"], teacher_email=teacher, decision=decision, teacher_feedback=feedback
+    )
+    return sc.update_project_privacy_consent(project["id"], False) if revoke else project
+
+
+@pytest.fixture
+def analytics_data(people, clock, monkeypatch):
+    """Ingeniería de Software (ciclo 8) en 2026-2 y 2026-1, Inteligencia Artificial (ciclo 9) y
+    Base de Datos (ciclo 5, solo un borrador), con proyectos en los cuatro estados."""
+    # Ingeniería de Software 2026-2: el otro docente escribió el curso en minúsculas (mismo grupo).
+    analytics_project(clock, techs=["Python", "FastAPI"], decision="Validado", seconds=120)
+    analytics_project(clock, techs=["python", "PostgreSQL"], decision="Validado", seconds=300, revoke=True)
+    analytics_project(clock, "ingeniería de software", techs=["Python", "Docker"], decision="Validado",
+                      seconds=301, teacher=OTHER_TEACHER)
+    analytics_project(clock, techs=["Java"], decision="Observado", seconds=900)
+    analytics_project(clock, techs=["Go"])
+    analytics_project(clock)
+    analytics_project(clock, "Base de Datos", "5")
+    analytics_project(clock, IA_COURSE, "9", techs=["Python", "pandas"], decision="Validado", seconds=240,
+                      teacher=OTHER_TEACHER)
+    analytics_project(clock, IA_COURSE, "9", techs=["pandas"], decision="Observado", seconds=100,
+                      teacher=OTHER_TEACHER)
+    monkeypatch.setattr(sc, "CURRENT_SEMESTER", "2026-1")
+    analytics_project(clock, techs=["Java", "Spring Boot"], decision="Validado", seconds=60)
+    monkeypatch.setattr(sc, "CURRENT_SEMESTER", "2026-2")
+
+
+def sla_row(*values):
+    return dict(zip(sc.TEACHER_SLA_COLUMNS, values))
+
+
+def tech_row(*values):
+    return dict(zip(sc.CURRICULUM_TECH_METRICS_COLUMNS, values))
+
+
+def test_teacher_sla_performance_counts_every_state_exactly(analytics_data):
+    assert sc.get_teacher_sla_performance() == [
+        sla_row("Base de Datos", 5, "2026-2", 1, 0, 0, 0, None, None, None, 0, None, 0, None),
+        sla_row(IS_COURSE, 8, "2026-1", 1, 0, 0, 1, 100.0, 60, 60.0, 1, 100.0, 1, 100.0),
+        sla_row(IS_COURSE, 8, "2026-2", 6, 1, 1, 3, 75.0, 721, 240.33, 2, 66.67, 2, 66.67),
+        sla_row(IA_COURSE, 9, "2026-2", 2, 0, 1, 1, 50.0, 240, 240.0, 1, 100.0, 1, 100.0),
+    ]
+
+
+def test_curriculum_tech_metrics_counts_only_validated_technologies(analytics_data):
+    assert sc.get_curriculum_tech_metrics() == [
+        tech_row(IS_COURSE, 8, "2026-1", "Java", 1, 1, 100.0),
+        tech_row(IS_COURSE, 8, "2026-1", "Spring Boot", 1, 1, 100.0),
+        tech_row(IS_COURSE, 8, "2026-2", "Python", 3, 3, 100.0),
+        tech_row(IS_COURSE, 8, "2026-2", "Docker", 1, 3, 33.33),
+        tech_row(IS_COURSE, 8, "2026-2", "FastAPI", 1, 3, 33.33),
+        tech_row(IS_COURSE, 8, "2026-2", "PostgreSQL", 1, 3, 33.33),
+        tech_row(IA_COURSE, 9, "2026-2", "pandas", 1, 1, 100.0),
+        tech_row(IA_COURSE, 9, "2026-2", "Python", 1, 1, 100.0),
+    ]
+
+
+def test_analytics_summary_reports_global_kpis(analytics_data):
+    summary = sc.get_analytics_summary()
+
+    assert summary["filters_applied"] == {"course_name": None, "cycle": None, "semester": None}
+    assert (
+        summary["total_registered_projects"],
+        summary["total_validated_projects"],
+        summary["total_in_review_projects"],
+        summary["total_observed_projects"],
+    ) == (10, 5, 1, 2)
+    assert summary["validation_rate_percent"] == 71.43  # 5 validados de 7 decididos
+    assert summary["avg_review_seconds"] == 204.2  # (120 + 300 + 301 + 240 + 60) / 5
+    assert (summary["sla_target_seconds"], summary["reviews_within_sla_percent"]) == (300, 80.0)
+    assert (summary["public_portfolio_projects"], summary["public_portfolio_percent"]) == (4, 80.0)
+    assert summary["top_technologies"] == [
+        {"technology": "Python", "project_count": 4, "percentage": 80.0},
+        *[
+            {"technology": name, "project_count": 1, "percentage": 20.0}
+            for name in ("Docker", "FastAPI", "Java", "pandas", "PostgreSQL", "Spring Boot")
+        ],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("filters", "registered", "validated", "rate", "average"),
+    [
+        ({"course_name": "  INGENIERÍA DE SOFTWARE "}, 7, 4, 80.0, 195.25),
+        ({"cycle": "8vo Ciclo"}, 7, 4, 80.0, 195.25),
+        ({"cycle": 5}, 1, 0, None, None),
+        ({"semester": "2026-2"}, 9, 4, 66.67, 240.25),
+        ({"semester": "2026-1"}, 1, 1, 100.0, 60.0),
+        ({"course_name": "inteligencia artificial", "cycle": "9", "semester": "2026-2"}, 2, 1, 50.0, 240.0),
+        ({"course_name": IS_COURSE, "cycle": 8, "semester": "2026-2"}, 6, 3, 75.0, 240.33),
+        ({"course_name": IA_COURSE, "cycle": 8}, 0, 0, None, None),
+        ({"course_name": "", "cycle": "  ", "semester": None}, 10, 5, 71.43, 204.2),
+    ],
+)
+def test_analytics_filters_are_combinable_and_exact(analytics_data, filters, registered, validated, rate, average):
+    summary = sc.get_analytics_summary(**filters)
+    sla_rows = sc.get_teacher_sla_performance(**filters)
+    tech_rows = sc.get_curriculum_tech_metrics(**filters)
+
+    assert (summary["total_registered_projects"], summary["total_validated_projects"]) == (registered, validated)
+    assert (summary["validation_rate_percent"], summary["avg_review_seconds"]) == (rate, average)
+    assert sum(row["registered_projects"] for row in sla_rows) == registered
+    assert {row["validated_projects"] for row in tech_rows} <= {row["validated_projects"] for row in sla_rows}
+    if validated == 0:
+        assert tech_rows == [] and summary["top_technologies"] == []
+
+
+def test_analytics_ignore_drafts_in_review_and_observed_projects(analytics_data, clock):
+    tech_before = sc.get_curriculum_tech_metrics()
+    before = sc.get_analytics_summary()
+
+    analytics_project(clock)
+    analytics_project(clock, techs=["Rust"])
+    observed = analytics_project(clock, techs=["Kotlin"], decision="Observado", seconds=5)
+    for tech in sc._local_backend.technologies:  # etiqueta marcada como validada en un proyecto observado
+        if tech["project_id"] == observed["id"]:
+            tech["validated_by_teacher"] = True
+    after = sc.get_analytics_summary()
+
+    assert sc.get_curriculum_tech_metrics() == tech_before
+    unchanged = (
+        "total_validated_projects",
+        "avg_review_seconds",
+        "reviews_within_sla_percent",
+        "public_portfolio_projects",
+        "public_portfolio_percent",
+        "top_technologies",
+    )
+    assert {key: after[key] for key in unchanged} == {key: before[key] for key in unchanged}
+    assert after["total_registered_projects"] == before["total_registered_projects"] + 3
+    assert after["total_in_review_projects"] == before["total_in_review_projects"] + 1
+    assert after["total_observed_projects"] == before["total_observed_projects"] + 1
+    assert after["validation_rate_percent"] == 62.5  # 5 validados de 8 decididos
+
+
+def test_technologies_are_grouped_ignoring_case_with_deterministic_name(people, clock):
+    analytics_project(clock, "Cloud Computing", "9", techs=["docker", "AWS"], decision="Validado")
+    analytics_project(clock, "Cloud Computing", "9", techs=["Docker"], decision="Validado")
+    analytics_project(clock, "Cloud Computing", "9", techs=["aws"], decision="Validado")
+
+    rows = sc.get_curriculum_tech_metrics(course_name="cloud computing")
+
+    # Empate docker/Docker y AWS/aws: gana la primera forma en orden binario, como mode() de la vista.
+    assert [(row["technology"], row["project_count"], row["usage_percent"]) for row in rows] == [
+        ("AWS", 2, 66.67),
+        ("Docker", 2, 66.67),
+    ]
+
+
+def test_ratios_round_half_up_like_postgresql():
+    assert sc._round_ratio(1001, 8) == 125.13  # round(125.125, 2) de Python daría 125.12
+    assert sc._round_ratio(1, 800, 100) == 0.13
+    assert sc._round_ratio(2, 3, 100) == 66.67
+    assert sc._round_ratio(5, 0, 100) is None
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        {"semester": "2026-3"},
+        {"semester": "26-2"},
+        {"semester": "2026/2"},
+        {"semester": 20262},
+        {"cycle": 0},
+        {"cycle": 11},
+        {"cycle": "ciclo"},
+        {"cycle": True},
+        {"course_name": "IS"},
+        {"course_name": 123},
+    ],
+)
+@pytest.mark.parametrize(
+    "function", [sc.get_curriculum_tech_metrics, sc.get_teacher_sla_performance, sc.get_analytics_summary]
+)
+def test_analytics_reject_invalid_filters(function, filters):
+    with pytest.raises(sc.ProjectValidationError) as error:
+        function(**filters)
+
+    assert error.value.http_status == 400
+
+
+def view_body(view):
+    sql = MIGRATION_05.read_text(encoding="utf-8")
+    return re.search(rf"CREATE VIEW public\.{view}\b(.*?);", sql, re.S).group(1)
+
+
+@pytest.mark.parametrize(
+    ("view", "columns"),
+    [
+        (sc.CURRICULUM_TECH_METRICS_VIEW, sc.CURRICULUM_TECH_METRICS_COLUMNS),
+        (sc.TEACHER_SLA_VIEW, sc.TEACHER_SLA_COLUMNS),
+    ],
+)
+def test_analytics_views_of_migration_05_match_backend_and_hide_people(view, columns):
+    sql = MIGRATION_05.read_text(encoding="utf-8")
+    body = view_body(view)
+    select_list = body.rsplit("\nSELECT ", 1)[1].split("\nFROM ")[0]
+
+    assert re.findall(r"\bAS ([a-z_]+)\b", select_list) == list(columns)
+    assert body.startswith("\nWITH (security_invoker = true) AS")
+    assert "public.users" not in body and "email" not in body and "full_name" not in body
+    assert "'Validado'" in body
+    assert f"REVOKE ALL ON public.{view} FROM PUBLIC, anon, authenticated, service_role;" in sql
+    assert re.findall(rf"GRANT (\w+) ON public\.{view} TO (\w+);", sql) == [("SELECT", "service_role")]
+
+
+def test_sla_target_matches_view_and_local_rows_have_view_columns(analytics_data):
+    assert sc.SLA_TARGET_SECONDS == 300
+    assert f"active_review_seconds <= {sc.SLA_TARGET_SECONDS}" in view_body(sc.TEACHER_SLA_VIEW)
+    assert all(tuple(row) == sc.CURRICULUM_TECH_METRICS_COLUMNS for row in sc._local_backend.fetch_curriculum_tech_metrics())
+    assert all(tuple(row) == sc.TEACHER_SLA_COLUMNS for row in sc._local_backend.fetch_teacher_sla_performance())
+
+
+class FakeViewQuery:
+    """Consulta de la Data API sobre una vista: aplica eq() y range() y devuelve el total."""
+
+    def __init__(self, rows, calls):
+        self.rows, self.calls, self.filters, self.bounds = rows, calls, {}, (0, len(rows))
+
+    def __getattr__(self, name):
+        def method(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            return self
+
+        return method
+
+    def eq(self, column, value):
+        self.calls.append(("eq", (column, value), {}))
+        self.filters[column] = value
+        return self
+
+    def range(self, start, end):
+        self.calls.append(("range", (start, end), {}))
+        self.bounds = (start, end)
+        return self
+
+    def execute(self):
+        matching = [row for row in self.rows if all(row[column] == value for column, value in self.filters.items())]
+        start, end = self.bounds
+        return SimpleNamespace(data=deepcopy(matching[start : end + 1]), count=len(matching))
+
+
+def fake_views(monkeypatch, views):
+    calls = []
+
+    class FakeClient:
+        def table(self, name):
+            calls.append(("table", (name,), {}))
+            return FakeViewQuery(views.get(name, []), calls)
+
+    monkeypatch.setattr(sc, "get_admin_client", lambda: FakeClient())
+    return calls
+
+
+def test_supabase_analytics_read_only_the_views_with_period_filters(monkeypatch):
+    calls = fake_views(monkeypatch, {})
+
+    assert sc._SupabaseBackend().fetch_curriculum_tech_metrics(cycle=8, semester="2026-2") == []
+    assert sc._SupabaseBackend().fetch_teacher_sla_performance() == []
+    assert calls == [
+        ("table", ("vw_curriculum_tech_metrics",), {}),
+        ("select", (",".join(sc.CURRICULUM_TECH_METRICS_COLUMNS),), {"count": "exact"}),
+        ("eq", ("cycle", 8), {}),
+        ("eq", ("semester", "2026-2"), {}),
+        ("order", ("course_name",), {}),
+        ("order", ("cycle",), {}),
+        ("order", ("semester",), {}),
+        ("order", ("technology",), {}),
+        ("range", (0, 999), {}),
+        ("table", ("vw_teacher_sla_performance",), {}),
+        ("select", (",".join(sc.TEACHER_SLA_COLUMNS),), {"count": "exact"}),
+        ("order", ("course_name",), {}),
+        ("order", ("cycle",), {}),
+        ("order", ("semester",), {}),
+        ("range", (0, 999), {}),
+    ]
+
+
+def test_supabase_analytics_read_every_page(monkeypatch):
+    rows = [{"fila": number} for number in range(5)]
+    calls = fake_views(monkeypatch, {sc.TEACHER_SLA_VIEW: rows})
+    monkeypatch.setattr(sc, "ANALYTICS_PAGE_SIZE", 2)
+
+    assert sc._SupabaseBackend().fetch_teacher_sla_performance() == rows
+    assert [args for name, args, _ in calls if name == "range"] == [(0, 1), (2, 3), (4, 5)]
+
+
+def test_supabase_analytics_errors_become_database_error(monkeypatch):
+    class BrokenClient:
+        def table(self, name):
+            raise ConnectionError("sin red")
+
+    monkeypatch.setattr(sc, "get_admin_client", lambda: BrokenClient())
+    monkeypatch.setattr(sc, "_backend", lambda: sc._supabase_backend)
+
+    with pytest.raises(sc.DatabaseError) as error:
+        sc.get_analytics_summary()
+
+    assert error.value.http_status == 503
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        {},
+        {"course_name": "ingeniería de software"},
+        {"cycle": "8vo Ciclo", "semester": "2026-2"},
+        {"course_name": IA_COURSE, "semester": "2025-1"},
+    ],
+)
+def test_supabase_mode_returns_the_same_results_as_local_mode(analytics_data, monkeypatch, filters):
+    functions = (sc.get_curriculum_tech_metrics, sc.get_teacher_sla_performance, sc.get_analytics_summary)
+    expected = [function(**filters) for function in functions]
+    # Filas de las vistas en otro orden: el resultado no depende del orden en que llegan.
+    views = {
+        sc.CURRICULUM_TECH_METRICS_VIEW: sc._local_backend.fetch_curriculum_tech_metrics()[::-1],
+        sc.TEACHER_SLA_VIEW: sc._local_backend.fetch_teacher_sla_performance()[::-1],
+    }
+    calls = fake_views(monkeypatch, views)
+    monkeypatch.setattr(sc, "_backend", lambda: sc._supabase_backend)
+
+    assert [function(**filters) for function in functions] == expected
+    assert not any(name == "eq" and args[0] == "course_name" for name, args, _ in calls)
