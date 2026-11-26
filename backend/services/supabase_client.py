@@ -1,4 +1,4 @@
-"""Conexión con Supabase y persistencia de proyectos del backend (Módulos 3.1 a 3.5).
+"""Conexión con Supabase y persistencia de proyectos del backend (Módulos 3.1 a 3.6).
 
 Se usan dos tipos de cliente:
 - Administrador (clave service_role): solo vive en el backend y omite RLS,
@@ -12,8 +12,10 @@ Persistencia de proyectos (HU03, HU04, HU06, HU07, HU10 y HU11):
   plano con las claves de PROJECTS_DB más verification_code y consent_revoked_at.
 - El portafolio público (get_public_portfolio_projects) se lee de la vista
   public_verified_portfolios y nunca devuelve correos.
-- Modo "supabase": tablas de database/01_schema.sql, 02_sprint2_migration.sql y
-  04_sprint3_portfolio.sql.
+- Las métricas del panel de autoridades (HU12, HU13: get_curriculum_tech_metrics,
+  get_teacher_sla_performance y get_analytics_summary) se leen de las vistas
+  vw_curriculum_tech_metrics y vw_teacher_sla_performance y solo cuentan proyectos 'Validado'.
+- Modo "supabase": tablas y vistas de database/01_schema.sql a 05_sprint4_analytics_views.sql.
 - Modo "local": memoria del proceso (pruebas y CI), con las mismas restricciones que la base.
   El modo se decide una sola vez (ver resolve_persistence_mode) y nunca cambia por un
   error de red: si Supabase falla se lanza DatabaseError.
@@ -49,6 +51,7 @@ from collections.abc import Iterable, Mapping
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -58,7 +61,7 @@ from dotenv import load_dotenv
 from supabase import Client, ClientOptions, PostgrestAPIError, create_client
 
 from services.evidence_extractor import GITHUB_OWNER_PATTERN, GITHUB_REPOSITORY_PATTERN
-from services.quality_metrics import teacher_active_time_seconds
+from services.quality_metrics import MAX_TEACHER_ACTIVE_SECONDS, teacher_active_time_seconds
 from services.validators import is_institutional_email
 
 # Carga backend/.env sin importar desde qué carpeta se levante el servidor.
@@ -132,7 +135,8 @@ EDITABLE_STATUSES = (STATUS_DRAFT, STATUS_OBSERVED)  # admiten evidencia nueva y
 TEACHER_DECISIONS = (STATUS_VALIDATED, STATUS_OBSERVED)
 USER_ROLES = ("Estudiante", "Docente", "Autoridad")
 
-CURRENT_SEMESTER = "2026-2"
+CURRENT_SEMESTER = "2026-2"  # semestre de los cursos nuevos (columna courses.semester de la 05)
+SEMESTER_PATTERN = re.compile(r"[0-9]{4}-[12]")  # AAAA-1 o AAAA-2; se usa con fullmatch (courses_semester_check)
 DEFAULT_VALIDATION_FEEDBACK = "Acreditación conforme."
 MIN_OBSERVATION_FEEDBACK_CHARS = 5
 MAX_FEEDBACK_CHARS = 1000
@@ -172,12 +176,44 @@ PUBLIC_PORTFOLIO_COLUMNS = (
     "teacher_full_name",
 )
 
+# HU12 y HU13: vistas analíticas de database/05_sprint4_analytics_views.sql.
+# Sin correos ni nombres de personas; solo cuentan proyectos 'Validado' (salvo los conteos por estado).
+CURRICULUM_TECH_METRICS_VIEW = "vw_curriculum_tech_metrics"
+CURRICULUM_TECH_METRICS_COLUMNS = (
+    "course_name",
+    "cycle",
+    "semester",
+    "technology",
+    "project_count",
+    "validated_projects",
+    "usage_percent",
+)
+TEACHER_SLA_VIEW = "vw_teacher_sla_performance"
+TEACHER_SLA_COLUMNS = (
+    "course_name",
+    "cycle",
+    "semester",
+    "registered_projects",
+    "in_review_projects",
+    "observed_projects",
+    "validated_projects",
+    "validation_rate_percent",
+    "total_review_seconds",
+    "avg_review_seconds",
+    "reviews_within_sla",
+    "reviews_within_sla_percent",
+    "public_portfolio_projects",
+    "public_portfolio_percent",
+)
+SLA_TARGET_SECONDS = MAX_TEACHER_ACTIVE_SECONDS  # meta de revisión docente: 300 segundos
+ANALYTICS_PAGE_SIZE = 1000  # la Data API de Supabase devuelve como máximo 1000 filas por respuesta
+
 # Proyecto con su estudiante, su curso (con el docente) y sus tecnologías en una sola consulta.
 # Los nombres de las claves foráneas evitan la ambigüedad users <-> courses a través de projects.
 _PROJECT_SELECT = (
     "*,"
     "student:users!projects_student_id_fkey(email),"
-    "course:courses(name,cycle,teacher_id,teacher:users!courses_teacher_id_fkey(email)),"
+    "course:courses(name,cycle,semester,teacher_id,teacher:users!courses_teacher_id_fkey(email)),"
     "project_technologies(technology_name,validated_by_teacher,created_at)"
 )
 
@@ -209,6 +245,7 @@ PRIVACY_STATE_DETAIL = (
 )
 PORTFOLIO_NOT_FOUND_DETAIL = "Portafolio no encontrado o sin proyectos publicados."
 VERIFICATION_CODE_DETAIL = "No se pudo generar un código de verificación único. Intenta nuevamente."
+SEMESTER_DETAIL = "El semestre debe tener el formato AAAA-1 o AAAA-2 (por ejemplo, 2026-2)."
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +469,13 @@ def _parse_cycle(cycle: str | int) -> int:
     return number
 
 
+def _parse_semester(semester: str) -> str:
+    """Semestre académico con formato AAAA-1 o AAAA-2 (el mismo de courses_semester_check)."""
+    if not isinstance(semester, str) or not SEMESTER_PATTERN.fullmatch(semester.strip()):
+        raise ProjectValidationError(SEMESTER_DETAIL)
+    return semester.strip()
+
+
 def _clean_technologies(names: Iterable[str] | None) -> list[str]:
     """Quita espacios, vacíos y repetidos (sin distinguir mayúsculas), respetando el orden."""
     cleaned: list[str] = []
@@ -473,9 +517,25 @@ def _serialize(row: Mapping) -> dict:
     return {key: value.isoformat() if isinstance(value, datetime) else value for key, value in row.items()}
 
 
+_TWO_DECIMALS = Decimal("0.01")
+
+
+def _round_ratio(numerator: int, denominator: int, factor: int = 1) -> float | None:
+    """round(factor * numerator / denominator, 2) como en PostgreSQL, o None si el denominador es 0.
+
+    Usa aritmética decimal exacta y redondea la mitad hacia arriba (0,125 -> 0,13), igual que
+    round() sobre numeric en las vistas de la 05; round() de Python daría 0,12.
+    """
+    if not denominator:
+        return None
+    ratio = Decimal(factor) * Decimal(numerator) / Decimal(denominator)
+    return float(ratio.quantize(_TWO_DECIMALS, rounding=ROUND_HALF_UP))
+
+
 # ---------------------------------------------------------------------------
 # Restricciones de la base replicadas en el modo local
-# (deben coincidir con 01_schema.sql, 02_sprint2_migration.sql y 04_sprint3_portfolio.sql)
+# (deben coincidir con 01_schema.sql, 02_sprint2_migration.sql, 04_sprint3_portfolio.sql
+# y 05_sprint4_analytics_views.sql)
 # ---------------------------------------------------------------------------
 _GITHUB_URL_DB_PATTERN = re.compile(r"^https://(www\.)?github\.com/[^/?#]+/[^/?#]+")
 _EVIDENCE_HASH_DB_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -596,7 +656,7 @@ class _SupabaseBackend:
     def list_courses_for_teacher(self, teacher_id: str) -> list[dict]:
         result = self._execute(
             "listar cursos",
-            lambda c: c.table(COURSES_TABLE).select("id,code,name,cycle,teacher_id").eq("teacher_id", teacher_id),
+            lambda c: c.table(COURSES_TABLE).select("id,code,name,cycle,semester,teacher_id").eq("teacher_id", teacher_id),
         )
         return result.data or []
 
@@ -678,6 +738,58 @@ class _SupabaseBackend:
         )
         return result.data or []
 
+    def _fetch_all_pages(self, action: str, build_query) -> list[dict]:
+        """Lee todas las filas de una vista analítica, de ANALYTICS_PAGE_SIZE en ANALYTICS_PAGE_SIZE.
+
+        La Data API corta cada respuesta en un máximo de filas, así que se pide el total
+        (count="exact" en build_query) y se avanza con range() hasta reunirlas todas.
+        build_query debe ordenar por columnas que identifiquen cada fila, para que las
+        páginas no se repitan ni se salten filas.
+        """
+        rows: list[dict] = []
+        while True:
+            start = len(rows)
+            result = self._execute(
+                action, lambda c, start=start: build_query(c).range(start, start + ANALYTICS_PAGE_SIZE - 1)
+            )
+            page = result.data or []
+            rows.extend(page)
+            total = result.count if result.count is not None else len(rows)
+            if not page or len(rows) >= total:
+                return rows
+
+    @staticmethod
+    def _period_filters(query, cycle: int | None, semester: str | None):
+        if cycle is not None:
+            query = query.eq("cycle", cycle)
+        if semester is not None:
+            query = query.eq("semester", semester)
+        return query
+
+    def fetch_curriculum_tech_metrics(self, *, cycle: int | None = None, semester: str | None = None) -> list[dict]:
+        """Filas de la vista vw_curriculum_tech_metrics; el ciclo y el semestre se filtran en la base."""
+
+        def build(c):
+            query = c.table(CURRICULUM_TECH_METRICS_VIEW).select(",".join(CURRICULUM_TECH_METRICS_COLUMNS), count="exact")
+            return (
+                self._period_filters(query, cycle, semester)
+                .order("course_name")
+                .order("cycle")
+                .order("semester")
+                .order("technology")
+            )
+
+        return self._fetch_all_pages("consultar métricas de tecnologías", build)
+
+    def fetch_teacher_sla_performance(self, *, cycle: int | None = None, semester: str | None = None) -> list[dict]:
+        """Filas de la vista vw_teacher_sla_performance; el ciclo y el semestre se filtran en la base."""
+
+        def build(c):
+            query = c.table(TEACHER_SLA_VIEW).select(",".join(TEACHER_SLA_COLUMNS), count="exact")
+            return self._period_filters(query, cycle, semester).order("course_name").order("cycle").order("semester")
+
+        return self._fetch_all_pages("consultar desempeño docente", build)
+
 
 class _LocalBackend:
     """Tablas en memoria con las mismas restricciones que la base (claves, UNIQUE y CHECK)."""
@@ -733,17 +845,19 @@ class _LocalBackend:
 
     def insert_course(self, row: dict) -> dict:
         with self._lock:
-            course = {"id": str(uuid.uuid4()), "created_at": _utcnow(), **row}
+            course = {"id": str(uuid.uuid4()), "created_at": _utcnow(), "semester": CURRENT_SEMESTER, **row}
             if any(existing["code"] == course["code"] for existing in self.courses.values()):
                 raise DatabaseError(code="23505", constraint="courses_code_key")
             if not 1 <= course["cycle"] <= 10:
                 raise DatabaseError(code="23514", constraint="courses_cycle_check")
+            if not isinstance(course["semester"], str) or not SEMESTER_PATTERN.fullmatch(course["semester"]):
+                raise DatabaseError(code="23514", constraint="courses_semester_check")
             if course["teacher_id"] is not None:
                 if course["teacher_id"] not in self.users:
                     raise DatabaseError(code="23503", constraint="courses_teacher_id_fkey")
-                key = (course["teacher_id"], course["name"].lower())
-                if any((c["teacher_id"], c["name"].lower()) == key for c in self.courses.values()):
-                    raise DatabaseError(code="23505", constraint="courses_teacher_name_key")
+                key = (course["teacher_id"], course["name"].lower(), course["semester"])
+                if any((c["teacher_id"], c["name"].lower(), c["semester"]) == key for c in self.courses.values()):
+                    raise DatabaseError(code="23505", constraint="courses_teacher_name_semester_key")
             self.courses[course["id"]] = course
             return dict(course)
 
@@ -793,6 +907,7 @@ class _LocalBackend:
             "course": {
                 "name": course["name"],
                 "cycle": course["cycle"],
+                "semester": course["semester"],
                 "teacher_id": course["teacher_id"],
                 "teacher": {"email": teacher["email"]} if teacher else None,
             },
@@ -897,6 +1012,115 @@ class _LocalBackend:
             rows.sort(key=lambda row: row["decision_at"], reverse=True)
             return rows
 
+    # --- Vistas analíticas de la 05 (HU12, HU13) ---------------------------------
+    # Un grupo es (nombre del curso en minúsculas, ciclo, semestre). Su nombre visible es el menor
+    # en orden de puntos de código, que coincide con min(name COLLATE "C") de la vista.
+    def _course_group(self, course_id: str) -> tuple[str, int, str]:
+        course = self.courses[course_id]
+        return course["name"].lower(), course["cycle"], course["semester"]
+
+    def _course_group_names(self) -> dict[tuple[str, int, str], str]:
+        names: dict[tuple[str, int, str], str] = {}
+        for course in self.courses.values():
+            group = self._course_group(course["id"])
+            names[group] = min(names.get(group, course["name"]), course["name"])
+        return names
+
+    @staticmethod
+    def _in_period(group: tuple[str, int, str], cycle: int | None, semester: str | None) -> bool:
+        return (cycle is None or group[1] == cycle) and (semester is None or group[2] == semester)
+
+    def fetch_curriculum_tech_metrics(self, *, cycle: int | None = None, semester: str | None = None) -> list[dict]:
+        """Mismas filas que la vista vw_curriculum_tech_metrics de la 05."""
+        with self._lock:
+            names = self._course_group_names()
+            validated_groups = {
+                project["id"]: self._course_group(project["course_id"])
+                for project in self.projects.values()
+                if project["status"] == STATUS_VALIDATED
+            }
+            validated_per_group: dict[tuple[str, int, str], int] = {}
+            for group in validated_groups.values():
+                validated_per_group[group] = validated_per_group.get(group, 0) + 1
+
+            # (grupo, tecnología en minúsculas) -> forma de escribirla -> proyectos que la usan así
+            uses: dict[tuple, dict[str, set[str]]] = {}
+            for tech in self.technologies:
+                group = validated_groups.get(tech["project_id"])
+                if group is None or not tech["validated_by_teacher"]:
+                    continue
+                name = tech["technology_name"]
+                uses.setdefault((group, name.lower()), {}).setdefault(name, set()).add(tech["project_id"])
+
+            rows = []
+            for (group, _technology_key), spellings in uses.items():
+                if not self._in_period(group, cycle, semester):
+                    continue
+                project_count = len(set().union(*spellings.values()))
+                # mode() de la vista: la forma más usada; si empatan, la primera en orden binario.
+                technology = min(spellings, key=lambda spelling: (-len(spellings[spelling]), spelling))
+                rows.append(
+                    {
+                        "course_name": names[group],
+                        "cycle": group[1],
+                        "semester": group[2],
+                        "technology": technology,
+                        "project_count": project_count,
+                        "validated_projects": validated_per_group[group],
+                        "usage_percent": _round_ratio(project_count, validated_per_group[group], 100),
+                    }
+                )
+            return rows
+
+    def fetch_teacher_sla_performance(self, *, cycle: int | None = None, semester: str | None = None) -> list[dict]:
+        """Mismas filas que la vista vw_teacher_sla_performance de la 05."""
+        with self._lock:
+            names = self._course_group_names()
+            stats: dict[tuple[str, int, str], dict] = {}
+            for project in self.projects.values():
+                group = self._course_group(project["course_id"])
+                if not self._in_period(group, cycle, semester):
+                    continue
+                current = stats.setdefault(
+                    group,
+                    {"registered": 0, "in_review": 0, "observed": 0, "validated": 0, "seconds": [], "within_sla": 0, "public": 0},
+                )
+                current["registered"] += 1
+                if project["status"] == STATUS_IN_REVIEW:
+                    current["in_review"] += 1
+                elif project["status"] == STATUS_OBSERVED:
+                    current["observed"] += 1
+                elif project["status"] == STATUS_VALIDATED:
+                    current["validated"] += 1
+                    seconds = project["active_review_seconds"]
+                    if seconds is not None:
+                        current["seconds"].append(seconds)
+                        current["within_sla"] += int(seconds <= SLA_TARGET_SECONDS)
+                    current["public"] += int(bool(project["consent_law_29733"]))
+
+            rows = []
+            for group, current in stats.items():
+                validated, seconds = current["validated"], current["seconds"]
+                rows.append(
+                    {
+                        "course_name": names[group],
+                        "cycle": group[1],
+                        "semester": group[2],
+                        "registered_projects": current["registered"],
+                        "in_review_projects": current["in_review"],
+                        "observed_projects": current["observed"],
+                        "validated_projects": validated,
+                        "validation_rate_percent": _round_ratio(validated, validated + current["observed"], 100),
+                        "total_review_seconds": sum(seconds) if seconds else None,
+                        "avg_review_seconds": _round_ratio(sum(seconds), len(seconds)),
+                        "reviews_within_sla": current["within_sla"],
+                        "reviews_within_sla_percent": _round_ratio(current["within_sla"], validated, 100),
+                        "public_portfolio_projects": current["public"],
+                        "public_portfolio_percent": _round_ratio(current["public"], validated, 100),
+                    }
+                )
+            return rows
+
 
 _supabase_backend = _SupabaseBackend()
 _local_backend = _LocalBackend()
@@ -934,7 +1158,7 @@ def _to_record(row: dict) -> dict:
         "title": row["title"],
         "course_name": course.get("name"),
         "cycle": str(course["cycle"]) if course.get("cycle") is not None else None,
-        "semester": CURRENT_SEMESTER,
+        "semester": course.get("semester") or CURRENT_SEMESTER,
         "student_email": (row.get("student") or {}).get("email"),
         "teacher_email": _teacher_email(row),
         "status": row["status"],
@@ -1004,20 +1228,28 @@ def _require_user(backend, email: str, role: str) -> dict:
     return user
 
 
-def _get_or_create_course(backend, teacher_id: str, name: str, cycle: int) -> dict:
-    """Busca el curso del docente por nombre (sin distinguir mayúsculas) o lo crea.
+def _get_or_create_course(backend, teacher_id: str, name: str, cycle: int, semester: str) -> dict:
+    """Busca el curso del docente por nombre (sin distinguir mayúsculas) en el semestre indicado,
+    o lo crea con ese semestre (HU13: columna courses.semester de la 05).
 
-    Si el curso ya existe se usa su ciclo registrado. Si otro registro lo crea al mismo
-    tiempo, el índice courses_teacher_name_key rechaza el duplicado y se vuelve a buscar.
+    Cada semestre es un curso propio. Si el curso ya existe se usa su ciclo registrado.
+    Si otro registro lo crea al mismo tiempo, el índice courses_teacher_name_semester_key
+    rechaza el duplicado y se vuelve a buscar.
     """
     key = name.lower()
     for _ in range(3):
         for course in backend.list_courses_for_teacher(teacher_id):
-            if course["name"].lower() == key:
+            if course["name"].lower() == key and course["semester"] == semester:
                 return course
         try:
             return backend.insert_course(
-                {"code": f"AUTO-{uuid.uuid4().hex[:8].upper()}", "name": name, "cycle": cycle, "teacher_id": teacher_id}
+                {
+                    "code": f"AUTO-{uuid.uuid4().hex[:8].upper()}",
+                    "name": name,
+                    "cycle": cycle,
+                    "semester": semester,
+                    "teacher_id": teacher_id,
+                }
             )
         except DatabaseError as exc:
             if exc.code != "23505":
@@ -1050,7 +1282,8 @@ def insert_project(*, title: str, course_name: str, cycle: str | int, student_em
     """HU03: registra el proyecto en 'Borrador'.
 
     El estudiante debe tener rol Estudiante y el docente rol Docente. El curso se busca entre
-    los del docente por nombre (sin distinguir mayúsculas) y, si no existe, se crea.
+    los del docente por nombre (sin distinguir mayúsculas) en el semestre actual
+    (CURRENT_SEMESTER) y, si no existe, se crea con ese semestre.
     Errores: ProjectValidationError (400), ReferenceNotFoundError (422), DatabaseError (503).
     """
     clean_title = _clean_text(title, "El título", 5, 255)
@@ -1063,7 +1296,7 @@ def insert_project(*, title: str, course_name: str, cycle: str | int, student_em
     with backend.atomic():
         student = _require_user(backend, student_address, "Estudiante")
         teacher = _require_user(backend, teacher_address, "Docente")
-        course = _get_or_create_course(backend, teacher["id"], clean_course, cycle_number)
+        course = _get_or_create_course(backend, teacher["id"], clean_course, cycle_number, CURRENT_SEMESTER)
         row = backend.insert_project(
             {"title": clean_title, "course_id": course["id"], "student_id": student["id"], "status": STATUS_DRAFT}
         )
@@ -1075,6 +1308,7 @@ def insert_project(*, title: str, course_name: str, cycle: str | int, student_em
             "course": {
                 "name": course["name"],
                 "cycle": course["cycle"],
+                "semester": course["semester"],
                 "teacher_id": teacher["id"],
                 "teacher": {"email": teacher["email"]},
             },
@@ -1409,6 +1643,148 @@ def get_public_portfolio_projects(student_email: str) -> dict:
             }
             for row in rows
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Panel analítico para autoridades (HU12, HU13)
+# ---------------------------------------------------------------------------
+def _is_blank(value) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _parse_analytics_filters(course_name, cycle, semester) -> tuple[str | None, int | None, str | None]:
+    """Valida los filtros combinables del panel. None o texto vacío significa "sin filtro".
+
+    - course_name: nombre del curso, sin distinguir mayúsculas (3 a 255 caracteres).
+    - cycle: número del 1 al 10 (8, "8" u "8vo Ciclo").
+    - semester: AAAA-1 o AAAA-2.
+    Lanza ProjectValidationError (400) si alguno no es válido.
+    """
+    course = None if _is_blank(course_name) else _clean_text(course_name, "El nombre del curso", 3, 255)
+    cycle_number = None if _is_blank(cycle) else _parse_cycle(cycle)
+    period = None if _is_blank(semester) else _parse_semester(semester)
+    return course, cycle_number, period
+
+
+def _analytics_rows(fetch, columns: tuple[str, ...], course: str | None, cycle: int | None, semester: str | None):
+    """Filas de una vista analítica con los tres filtros aplicados y solo sus columnas.
+
+    El ciclo y el semestre los filtra la base (o el modo local); el curso se compara aquí,
+    sin distinguir mayúsculas, con el nombre visible del grupo.
+    """
+    rows = fetch(cycle=cycle, semester=semester)
+    if course is not None:
+        key = course.lower()
+        rows = [row for row in rows if row["course_name"].lower() == key]
+    return [{column: row[column] for column in columns} for row in rows]
+
+
+def _group_sort_key(row: dict) -> tuple:
+    return row["course_name"].lower(), row["course_name"], row["cycle"], row["semester"]
+
+
+def get_curriculum_tech_metrics(course_name=None, cycle=None, semester=None) -> list[dict]:
+    """HU12/HU13: tecnologías validadas por curso, ciclo y semestre (vista vw_curriculum_tech_metrics).
+
+    Una fila por curso, ciclo, semestre y tecnología (sin distinguir mayúsculas), con las claves de
+    CURRICULUM_TECH_METRICS_COLUMNS: project_count (proyectos 'Validado' que la usan),
+    validated_projects (proyectos 'Validado' del grupo) y usage_percent (porcentaje entre ambos).
+    Solo cuenta tecnologías validadas por el docente en proyectos 'Validado'.
+    Los filtros son combinables (ver _parse_analytics_filters). Orden: curso, ciclo, semestre y,
+    dentro de cada grupo, de la tecnología más usada a la menos usada.
+    Errores: ProjectValidationError (400), DatabaseError (503).
+    """
+    filters = _parse_analytics_filters(course_name, cycle, semester)
+    rows = _analytics_rows(_backend().fetch_curriculum_tech_metrics, CURRICULUM_TECH_METRICS_COLUMNS, *filters)
+    return sorted(
+        rows,
+        key=lambda row: (*_group_sort_key(row), -row["project_count"], row["technology"].lower(), row["technology"]),
+    )
+
+
+def get_teacher_sla_performance(course_name=None, cycle=None, semester=None) -> list[dict]:
+    """HU12/HU13: flujo de revisión y SLA docente por curso, ciclo y semestre (vista vw_teacher_sla_performance).
+
+    Una fila por grupo con al menos un proyecto, con las claves de TEACHER_SLA_COLUMNS: proyectos
+    registrados, en revisión, observados y validados; tasa de validación (validados sobre
+    'Validado' + 'Observado'); suma y promedio de active_review_seconds, revisiones dentro de
+    SLA_TARGET_SECONDS y proyectos con portafolio público, todo sobre los proyectos 'Validado'.
+    Los porcentajes y el promedio son None cuando no hay proyectos sobre los cuales calcularlos.
+    Errores: ProjectValidationError (400), DatabaseError (503).
+    """
+    filters = _parse_analytics_filters(course_name, cycle, semester)
+    rows = _analytics_rows(_backend().fetch_teacher_sla_performance, TEACHER_SLA_COLUMNS, *filters)
+    return sorted(rows, key=_group_sort_key)
+
+
+def _technology_ranking(tech_rows: list[dict], validated_projects: int) -> list[dict]:
+    """Une las filas de vw_curriculum_tech_metrics por tecnología (sin distinguir mayúsculas).
+
+    Cada proyecto pertenece a un solo grupo, así que sumar project_count no cuenta dos veces
+    un proyecto. El nombre visible es la forma que suma más proyectos; si empatan, la primera
+    en orden binario.
+    """
+    merged: dict[str, dict[str, int]] = {}
+    for row in tech_rows:
+        spellings = merged.setdefault(row["technology"].lower(), {})
+        spellings[row["technology"]] = spellings.get(row["technology"], 0) + row["project_count"]
+
+    ranking = []
+    for spellings in merged.values():
+        project_count = sum(spellings.values())
+        ranking.append(
+            {
+                "technology": min(spellings, key=lambda spelling: (-spellings[spelling], spelling)),
+                "project_count": project_count,
+                "percentage": _round_ratio(project_count, validated_projects, 100),
+            }
+        )
+    ranking.sort(key=lambda item: (-item["project_count"], item["technology"].lower(), item["technology"]))
+    return ranking
+
+
+def get_analytics_summary(course_name=None, cycle=None, semester=None) -> dict:
+    """HU12/HU13: indicadores globales del panel de autoridades con los filtros combinables.
+
+    Se calculan sumando las filas de las dos vistas, así que coinciden con ellas:
+    - total_registered_projects (todos los estados) frente a total_validated_projects, más
+      total_in_review_projects y total_observed_projects.
+    - validation_rate_percent: validados sobre decididos ('Validado' + 'Observado').
+    - avg_review_seconds y reviews_within_sla_percent (meta de SLA_TARGET_SECONDS) de los
+      proyectos 'Validado'; todos tienen active_review_seconds (projects_review_seconds_check).
+    - public_portfolio_projects y public_portfolio_percent: validados con consentimiento activo
+      de la Ley N.° 29733.
+    - top_technologies: ranking de tecnologías validadas con project_count y percentage sobre
+      los proyectos validados, de la más usada a la menos usada.
+    Los porcentajes y el promedio son None si no hay proyectos sobre los cuales calcularlos.
+    Errores: ProjectValidationError (400), DatabaseError (503).
+    """
+    course, cycle_number, period = _parse_analytics_filters(course_name, cycle, semester)
+    backend = _backend()
+    sla_rows = _analytics_rows(backend.fetch_teacher_sla_performance, TEACHER_SLA_COLUMNS, course, cycle_number, period)
+    tech_rows = _analytics_rows(
+        backend.fetch_curriculum_tech_metrics, CURRICULUM_TECH_METRICS_COLUMNS, course, cycle_number, period
+    )
+
+    def total(column: str) -> int:
+        return sum(row[column] or 0 for row in sla_rows)
+
+    validated, observed = total("validated_projects"), total("observed_projects")
+    public = total("public_portfolio_projects")
+    return {
+        "filters_applied": {"course_name": course, "cycle": cycle_number, "semester": period},
+        "total_registered_projects": total("registered_projects"),
+        "total_validated_projects": validated,
+        "total_in_review_projects": total("in_review_projects"),
+        "total_observed_projects": observed,
+        "validation_rate_percent": _round_ratio(validated, validated + observed, 100),
+        "avg_review_seconds": _round_ratio(total("total_review_seconds"), validated),
+        "sla_target_seconds": SLA_TARGET_SECONDS,
+        "reviews_within_sla_percent": _round_ratio(total("reviews_within_sla"), validated, 100),
+        "public_portfolio_projects": public,
+        "public_portfolio_percent": _round_ratio(public, validated, 100),
+        "top_technologies": _technology_ranking(tech_rows, validated),
     }
 
 
